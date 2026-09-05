@@ -1371,8 +1371,8 @@ app.post('/api/flutterwave/initiate', async (req: Request, res: Response) => {
   }
 
   const reference = `SIGMA${Date.now()}${crypto.randomUUID().replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)}`;
-  const appUrl = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
-  const redirectUrl = `${appUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
+  const frontendUrl = (process.env.FRONTEND_URL || process.env.APP_URL || 'https://sigmawealthsolution.vercel.app').replace(/\/$/, '');
+  const redirectUrl = `${frontendUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
 
   try {
     const result = await initiateDirectCharge({

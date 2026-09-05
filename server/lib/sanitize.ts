@@ -20,7 +20,7 @@ function sanitizeValue(value: unknown): unknown {
       // Skip large base64 image payloads — only allow data:image URLs, don't strip to empty
       if (k === 'imageUrl' || k === 'image_url' || k === 'receiptImageUrl') {
         if (typeof v === 'string' && (v.startsWith('data:image/') || v.startsWith('https://'))) {
-          out[k] = v.length > 1_800_000 ? '' : v;
+          out[k] = v.length > 6_000_000 ? '' : v;
           continue;
         }
       }

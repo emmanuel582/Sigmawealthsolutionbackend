@@ -27,8 +27,8 @@ const app = express();
 const PORT = Number(process.env.PORT || process.env.SIGMA_API_PORT || 4000);
 
 applySecurityMiddleware(app);
-app.use(express.json({ limit: '2mb' }));
-app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(sanitizeRequestBody);
 
 // Health check endpoints for hosting (Render, Vercel, monitoring)
@@ -2658,13 +2658,13 @@ app.post('/api/admin/notifications/send', async (req: Request, res: Response) =>
     return res.status(400).json({ message: 'Select an investor for single alerts.' });
   }
 
-  // Cap base64 images (~1.5MB) to keep memory safe
-  if (imageUrl && typeof imageUrl === 'string' && imageUrl.length > 1_800_000) {
-    return res.status(400).json({ message: 'Image is too large. Use a smaller picture (under ~1MB).' });
+  // Cap base64 images (~5MB) to keep memory safe
+  if (imageUrl && typeof imageUrl === 'string' && imageUrl.length > 6_000_000) {
+    return res.status(400).json({ message: 'Image is too large. Use a smaller picture.' });
   }
 
   const notification = {
-    id: `notif-${Date.now()}`,
+    id: crypto.randomUUID(),
     title: String(title).trim(),
     body: String(body).trim(),
     audience: resolvedAudience,

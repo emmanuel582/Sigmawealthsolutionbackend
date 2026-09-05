@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import crypto3 from "crypto";
 
-// server/lib/flutterwaveV4.ts
+// server/lib/flutterwaveV4.js
 import crypto from "crypto";
 var TOKEN_URL = "https://idp.flutterwave.com/realms/flutterwave/protocol/openid-connect/token";
 var SANDBOX_API = "https://developersandbox-api.flutterwave.com";
@@ -236,7 +236,7 @@ async function completeSandboxCharge(chargeId) {
   return { charge, redirectUrl: null };
 }
 
-// server/lib/security.ts
+// server/lib/security.js
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
@@ -316,7 +316,7 @@ function productionErrorHandler(err, _req, res, _next) {
   });
 }
 
-// server/lib/sanitize.ts
+// server/lib/sanitize.js
 import xss from "xss";
 var XSS_OPTIONS = {
   whiteList: {},
@@ -361,7 +361,7 @@ function sanitizeRequestBody(req, _res, next) {
   next();
 }
 
-// server/lib/passwords.ts
+// server/lib/passwords.js
 import crypto2 from "crypto";
 import bcrypt from "bcryptjs";
 function hashPassword(password) {
@@ -387,8 +387,8 @@ var __dirname = path.dirname(__filename);
 var app = express();
 var PORT = Number(process.env.PORT || process.env.SIGMA_API_PORT || 4e3);
 applySecurityMiddleware(app);
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true, limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(sanitizeRequestBody);
 app.get("/", (req, res) => {
   res.json({
@@ -1482,8 +1482,8 @@ app.post("/api/flutterwave/initiate", async (req, res) => {
     return res.status(503).json({ message: "FLUTTERWAVE_ENCRYPTION_KEY is required for card payments." });
   }
   const reference = `SIGMA${Date.now()}${crypto3.randomUUID().replace(/[^a-zA-Z0-9]/g, "").slice(0, 8)}`;
-  const appUrl = (process.env.APP_URL || "http://localhost:3000").replace(/\/$/, "");
-  const redirectUrl = `${appUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
+  const frontendUrl = (process.env.FRONTEND_URL || process.env.APP_URL || "https://sigmawealthsolution.vercel.app").replace(/\/$/, "");
+  const redirectUrl = `${frontendUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
   try {
     const result = await initiateDirectCharge({
       amount: Number(amount),
@@ -2532,11 +2532,11 @@ app.post("/api/admin/notifications/send", async (req, res) => {
   if (resolvedAudience === "single" && !targetUserId) {
     return res.status(400).json({ message: "Select an investor for single alerts." });
   }
-  if (imageUrl && typeof imageUrl === "string" && imageUrl.length > 18e5) {
-    return res.status(400).json({ message: "Image is too large. Use a smaller picture (under ~1MB)." });
+  if (imageUrl && typeof imageUrl === "string" && imageUrl.length > 6e6) {
+    return res.status(400).json({ message: "Image is too large. Use a smaller picture." });
   }
   const notification = {
-    id: `notif-${Date.now()}`,
+    id: crypto3.randomUUID(),
     title: String(title).trim(),
     body: String(body).trim(),
     audience: resolvedAudience,

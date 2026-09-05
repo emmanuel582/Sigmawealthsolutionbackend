@@ -7,7 +7,8 @@
   "scripts": {
     "start": "tsx server/sigma-api.ts",
     "dev": "tsx watch server/sigma-api.ts",
-    "build": "echo 'Build complete'"
+    "build": "echo 'Build complete'",
+    "test": "vitest run"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",
@@ -26,7 +27,8 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.13.10",
-    "@types/validator": "^13.12.2"
+    "@types/validator": "^13.12.2",
+    "vitest": "^3.0.7"
   },
   "engines": {
     "node": ">=20.0.0"

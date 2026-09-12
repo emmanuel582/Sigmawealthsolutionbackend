@@ -227,6 +227,34 @@ export async function getCharge(chargeId: string) {
   return flwRequest(`/charges/${chargeId}`, { method: 'GET' });
 }
 
+/**
+ * Charge a previously saved payment method (tokenized card) for recurring / subscription billing.
+ * Flutterwave v4 General Flow: customer_id + payment_method_id + recurring: true
+ */
+export async function chargeSavedPaymentMethod(params: {
+  amount: number;
+  currency?: string;
+  reference: string;
+  customerId: string;
+  paymentMethodId: string;
+  redirectUrl?: string;
+}) {
+  return flwRequest('/charges', {
+    method: 'POST',
+    body: {
+      amount: params.amount,
+      currency: params.currency || 'NGN',
+      reference: params.reference,
+      customer_id: params.customerId,
+      payment_method_id: params.paymentMethodId,
+      recurring: true,
+      ...(params.redirectUrl ? { redirect_url: params.redirectUrl } : {}),
+    },
+    idempotencyKey: params.reference,
+    scenarioKey: isSandboxMode() ? 'scenario:auth_successful' : undefined,
+  });
+}
+
 export async function authorizeCharge(
   chargeId: string,
   authorization: Record<string, unknown>,
@@ -246,7 +274,11 @@ export async function getBanks(country = 'NG') {
 export async function resolveBankAccount(accountNumber: string, bankCode: string) {
   return flwRequest('/banks/account-resolve', {
     method: 'POST',
-    body: { account_number: accountNumber, bank_code: bankCode },
+    body: {
+      account_number: accountNumber,
+      bank_code: bankCode,
+      currency: 'NGN',
+    },
   });
 }
 

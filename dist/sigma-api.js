@@ -6,7 +6,7 @@ import dotenv from "dotenv";
 import { createClient } from "@supabase/supabase-js";
 import crypto3 from "crypto";
 
-// server/lib/flutterwaveV4.js
+// server/lib/flutterwaveV4.ts
 import crypto from "crypto";
 var TOKEN_URL = "https://idp.flutterwave.com/realms/flutterwave/protocol/openid-connect/token";
 var SANDBOX_API = "https://developersandbox-api.flutterwave.com";
@@ -169,6 +169,22 @@ async function initiateDirectCharge(params) {
 async function getCharge(chargeId) {
   return flwRequest(`/charges/${chargeId}`, { method: "GET" });
 }
+async function chargeSavedPaymentMethod(params) {
+  return flwRequest("/charges", {
+    method: "POST",
+    body: {
+      amount: params.amount,
+      currency: params.currency || "NGN",
+      reference: params.reference,
+      customer_id: params.customerId,
+      payment_method_id: params.paymentMethodId,
+      recurring: true,
+      ...params.redirectUrl ? { redirect_url: params.redirectUrl } : {}
+    },
+    idempotencyKey: params.reference,
+    scenarioKey: isSandboxMode() ? "scenario:auth_successful" : void 0
+  });
+}
 async function authorizeCharge(chargeId, authorization, scenarioKey) {
   return flwRequest(`/charges/${chargeId}`, {
     method: "PUT",
@@ -182,7 +198,11 @@ async function getBanks(country = "NG") {
 async function resolveBankAccount(accountNumber, bankCode) {
   return flwRequest("/banks/account-resolve", {
     method: "POST",
-    body: { account_number: accountNumber, bank_code: bankCode }
+    body: {
+      account_number: accountNumber,
+      bank_code: bankCode,
+      currency: "NGN"
+    }
   });
 }
 async function createDirectTransfer(params) {
@@ -236,15 +256,22 @@ async function completeSandboxCharge(chargeId) {
   return { charge, redirectUrl: null };
 }
 
-// server/lib/security.js
+// server/lib/security.ts
 import helmet from "helmet";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 function getAllowedOrigins() {
   const fromEnv = (process.env.ALLOWED_ORIGINS || "").split(",").map((s) => s.trim()).filter(Boolean);
-  const appUrl = (process.env.APP_URL || "").replace(/\/$/, "");
+  const appUrl = (process.env.APP_URL || process.env.FRONTEND_URL || "").replace(/\/$/, "");
   const defaults = ["http://localhost:3000", "http://127.0.0.1:3000"];
   return Array.from(/* @__PURE__ */ new Set([...defaults, ...fromEnv, ...appUrl ? [appUrl] : []]));
+}
+function isTrustedOrigin(origin) {
+  if (origin.includes("localhost") || origin.includes("127.0.0.1") || origin.endsWith(".vercel.app") || origin.endsWith(".onrender.com")) {
+    return true;
+  }
+  const allowed = getAllowedOrigins();
+  return allowed.includes(origin) || allowed.includes("*");
 }
 function applySecurityMiddleware(app2) {
   const isProd = process.env.NODE_ENV === "production";
@@ -255,32 +282,33 @@ function applySecurityMiddleware(app2) {
       contentSecurityPolicy: false,
       // API JSON only; Next sets page CSP
       crossOriginResourcePolicy: { policy: "cross-origin" },
+      crossOriginOpenerPolicy: { policy: "same-origin-allow-popups" },
       hsts: isProd ? { maxAge: 31536e3, includeSubDomains: true, preload: true } : false,
-      referrerPolicy: { policy: "strict-origin-when-cross-origin" }
+      referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+      frameguard: { action: "deny" },
+      noSniff: true,
+      xssFilter: true
     })
   );
-  if (isProd && process.env.FORCE_HTTPS === "1") {
+  if (isProd && process.env.FORCE_HTTPS !== "0") {
     app2.use((req, res, next) => {
       if (req.secure || req.headers["x-forwarded-proto"] === "https") return next();
-      return res.redirect(301, `https://${req.headers.host}${req.url}`);
+      const host = req.headers.host || "localhost";
+      return res.redirect(301, `https://${host}${req.url}`);
     });
   }
   app2.use(
     cors({
       origin(origin, callback) {
         if (!origin) return callback(null, true);
-        if (origin.includes("localhost") || origin.includes("127.0.0.1") || origin.endsWith(".vercel.app") || origin.endsWith(".onrender.com") || process.env.NODE_ENV !== "production") {
-          return callback(null, true);
-        }
-        const allowed = getAllowedOrigins();
-        if (allowed.includes(origin) || allowed.includes("*")) {
-          return callback(null, true);
-        }
-        return callback(null, true);
+        if (!isProd) return callback(null, true);
+        if (isTrustedOrigin(origin)) return callback(null, true);
+        return callback(new Error("Not allowed by CORS"));
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"]
+      allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin"],
+      maxAge: 600
     })
   );
   app2.options("*", cors());
@@ -302,6 +330,23 @@ function applySecurityMiddleware(app2) {
     message: { message: "Too many auth attempts. Please wait and try again." }
   });
   app2.use("/api/auth/", authLimiter);
+  const supportLimiter = rateLimit({
+    windowMs: 15 * 60 * 1e3,
+    max: Number(process.env.SUPPORT_RATE_LIMIT_MAX || 120),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: "Too many support requests. Please slow down." }
+  });
+  app2.use("/api/support/", supportLimiter);
+  const paymentLimiter = rateLimit({
+    windowMs: 15 * 60 * 1e3,
+    max: Number(process.env.PAYMENT_RATE_LIMIT_MAX || 60),
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: { message: "Too many payment attempts. Please try again later." }
+  });
+  app2.use("/api/flutterwave/", paymentLimiter);
+  app2.use("/api/payouts/", paymentLimiter);
 }
 function productionErrorHandler(err, _req, res, _next) {
   const isProd = process.env.NODE_ENV === "production";
@@ -316,7 +361,7 @@ function productionErrorHandler(err, _req, res, _next) {
   });
 }
 
-// server/lib/sanitize.js
+// server/lib/sanitize.ts
 import xss from "xss";
 var XSS_OPTIONS = {
   whiteList: {},
@@ -336,7 +381,7 @@ function sanitizeValue(value) {
     for (const [k, v] of Object.entries(value)) {
       if (k === "imageUrl" || k === "image_url" || k === "receiptImageUrl") {
         if (typeof v === "string" && (v.startsWith("data:image/") || v.startsWith("https://"))) {
-          out[k] = v.length > 18e5 ? "" : v;
+          out[k] = v.length > 6e6 ? "" : v;
           continue;
         }
       }
@@ -361,7 +406,7 @@ function sanitizeRequestBody(req, _res, next) {
   next();
 }
 
-// server/lib/passwords.js
+// server/lib/passwords.ts
 import crypto2 from "crypto";
 import bcrypt from "bcryptjs";
 function hashPassword(password) {
@@ -433,6 +478,7 @@ var store = {
   activity_log: [],
   platform_settings: {
     payout_mode: "manual",
+    interest_rate: 0.15,
     updated_by: "system",
     updated_at: (/* @__PURE__ */ new Date()).toISOString()
   },
@@ -440,7 +486,10 @@ var store = {
   current_session: null,
   referrals: [],
   auto_debit_plans: /* @__PURE__ */ new Map(),
-  auth_credentials: /* @__PURE__ */ new Map()
+  auth_credentials: /* @__PURE__ */ new Map(),
+  support_conversations: /* @__PURE__ */ new Map(),
+  support_messages: [],
+  support_typing: /* @__PURE__ */ new Map()
 };
 function makeReferralCode(userId) {
   const seed = String(userId).replace(/[^a-zA-Z0-9]/g, "").slice(-8).toUpperCase() || "SIGMA";
@@ -621,6 +670,111 @@ async function logActivity(actor, action, details, amount = null) {
     }
   }
   return item;
+}
+function parsePayoutModeValue(raw) {
+  if (!raw) return null;
+  if (typeof raw === "string") {
+    const cleaned = raw.trim().toLowerCase();
+    if (cleaned === "automatic" || cleaned === "manual") return cleaned;
+    try {
+      const parsed = JSON.parse(raw);
+      return parsePayoutModeValue(parsed);
+    } catch {
+      return null;
+    }
+  }
+  if (typeof raw === "object" && raw !== null) {
+    const mode = String(raw.mode || "").toLowerCase();
+    if (mode === "automatic" || mode === "manual") return mode;
+  }
+  return null;
+}
+function getBankDetailsForUser(userId) {
+  const direct = store.bank_details.get(userId);
+  if (direct?.account_number && direct?.bank_code) return direct;
+  const profile = store.profiles.get(userId);
+  if (profile?.id && profile.id !== userId) {
+    const byProfile = store.bank_details.get(profile.id);
+    if (byProfile?.account_number && byProfile?.bank_code) return byProfile;
+  }
+  return direct || null;
+}
+function notifyInvestor(userId, title, body, icon = "alert") {
+  const notification = {
+    id: `notif-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    title,
+    body,
+    audience: "single",
+    target_user_id: userId,
+    icon,
+    image_url: null,
+    sent_at: (/* @__PURE__ */ new Date()).toISOString(),
+    delivery_status: "delivered"
+  };
+  store.notifications.unshift(notification);
+  return notification;
+}
+function getInterestRate() {
+  const rate = Number(store.platform_settings.interest_rate);
+  return Number.isFinite(rate) && rate >= 0 ? rate : 0.15;
+}
+function ensureInvestmentPayoutSchedule(inv) {
+  if (!inv) return inv;
+  if (!inv.payout_phase) inv.payout_phase = "mid";
+  if (!inv.cycle_start_date) {
+    inv.cycle_start_date = inv.start_date || inv.created_at || (/* @__PURE__ */ new Date()).toISOString();
+  }
+  return inv;
+}
+function computePayoutForInvestment(inv) {
+  ensureInvestmentPayoutSchedule(inv);
+  const principal = Math.max(0, Number(inv.amount) || 0);
+  const phase = inv.payout_phase === "final" ? "final" : "mid";
+  const interestRate = getInterestRate();
+  if (phase === "mid") {
+    const amount = Math.round(principal * 0.5);
+    return {
+      amount,
+      phase: "mid",
+      label: "50% mid-cycle payout",
+      interestComponent: 0,
+      principalComponent: amount
+    };
+  }
+  const remaining = Math.round(principal * 0.5);
+  const interest = Math.round(principal * interestRate);
+  return {
+    amount: remaining + interest,
+    phase: "final",
+    label: `50% + ${(interestRate * 100).toFixed(0)}% interest`,
+    interestComponent: interest,
+    principalComponent: remaining
+  };
+}
+function advanceInvestmentAfterPayout(inv) {
+  ensureInvestmentPayoutSchedule(inv);
+  const now = /* @__PURE__ */ new Date();
+  if (inv.payout_phase !== "final") {
+    inv.payout_phase = "final";
+    const next = new Date(inv.cycle_start_date || now);
+    next.setDate(next.getDate() + 30);
+    inv.next_payment_date = next.toISOString().split("T")[0];
+  } else {
+    inv.payout_phase = "mid";
+    inv.cycle_count = (inv.cycle_count || 0) + 1;
+    const cycleStart = /* @__PURE__ */ new Date();
+    inv.cycle_start_date = cycleStart.toISOString();
+    const next = new Date(cycleStart);
+    next.setDate(next.getDate() + 14);
+    inv.next_payment_date = next.toISOString().split("T")[0];
+  }
+  store.investments.set(inv.user_id, inv);
+  return inv;
+}
+function addDaysIso(base, days) {
+  const d = new Date(base);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().split("T")[0];
 }
 app.get("/api/config", (req, res) => {
   res.json({
@@ -1063,7 +1217,6 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
         }
         if (!finalInvestment) {
           const now = /* @__PURE__ */ new Date();
-          const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString().split("T")[0];
           finalInvestment = {
             id: `inv-${Date.now()}`,
             user_id: userId,
@@ -1071,14 +1224,17 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
             phase: "Phase 1: Seed Accumulation",
             type: "opay",
             status: "active",
-            start_date: (/* @__PURE__ */ new Date()).toISOString(),
-            next_payment_date: nextMonth,
+            start_date: now.toISOString(),
+            cycle_start_date: now.toISOString(),
+            payout_phase: "mid",
+            next_payment_date: addDaysIso(now, 14),
             cycle_count: 1,
-            created_at: (/* @__PURE__ */ new Date()).toISOString()
+            created_at: now.toISOString()
           };
         } else {
           finalInvestment.amount = totalInvested;
           finalInvestment.status = "active";
+          ensureInvestmentPayoutSchedule(finalInvestment);
         }
       }
       return res.json({
@@ -1147,7 +1303,6 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
     profile.current_phase = phaseToUse;
     if (!investment) {
       const now = /* @__PURE__ */ new Date();
-      const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString().split("T")[0];
       investment = {
         id: `inv-${Date.now()}`,
         user_id: profileId,
@@ -1155,10 +1310,12 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
         phase: phaseToUse,
         type: latestApprovedReceipt ? "opay" : "auto",
         status: "active",
-        start_date: (/* @__PURE__ */ new Date()).toISOString(),
-        next_payment_date: nextMonth,
+        start_date: now.toISOString(),
+        cycle_start_date: now.toISOString(),
+        payout_phase: "mid",
+        next_payment_date: addDaysIso(now, 14),
         cycle_count: 1,
-        created_at: (/* @__PURE__ */ new Date()).toISOString()
+        created_at: now.toISOString()
       };
       store.investments.set(userId, investment);
       store.investments.set(profileId, investment);
@@ -1166,6 +1323,7 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
       investment.amount = calculatedTotalInvested;
       investment.phase = phaseToUse;
       investment.status = "active";
+      ensureInvestmentPayoutSchedule(investment);
     }
   }
   res.json({
@@ -1223,6 +1381,102 @@ app.post("/api/investor/auto-debit-plan", (req, res) => {
   });
   logActivity(profile?.name || userId, "AUTO_DEBIT_SET", `Monthly auto-debit set to \u20A6${Number(amount).toLocaleString()}`);
   res.json(plan);
+});
+app.post("/api/investor/process-auto-debits", async (_req, res) => {
+  if (!isFlutterwaveConfigured()) {
+    return res.status(503).json({ message: "Flutterwave is not configured." });
+  }
+  const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+  const frontendUrl = (process.env.FRONTEND_URL || process.env.APP_URL || "https://sigmawealthsolution.vercel.app").replace(/\/$/, "");
+  const results = [];
+  for (const plan of store.auto_debit_plans.values()) {
+    if (!plan.active || !plan.next_charge_date || plan.next_charge_date > today) continue;
+    const userId = plan.user_id;
+    const profile = store.profiles.get(userId);
+    const card = store.card_details.get(userId);
+    const amount = Number(plan.amount) || 0;
+    if (!amount || !profile?.email) {
+      results.push({ userId, status: "skipped", message: "Missing profile or amount" });
+      continue;
+    }
+    const reference = `SIGMAAD${Date.now()}${crypto3.randomUUID().replace(/[^a-zA-Z0-9]/g, "").slice(0, 6)}`;
+    const redirectUrl = `${frontendUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
+    try {
+      let charge = null;
+      let chargeId = null;
+      if (card?.flutterwave_card_token && card?.flutterwave_customer_id) {
+        const charged = await chargeSavedPaymentMethod({
+          amount,
+          reference,
+          customerId: card.flutterwave_customer_id,
+          paymentMethodId: card.flutterwave_card_token,
+          redirectUrl
+        });
+        charge = charged.data || charged;
+        chargeId = charge?.id || null;
+      } else {
+        const initiated = await initiateDirectCharge({
+          amount,
+          reference,
+          email: profile.email,
+          name: profile.name,
+          phone: profile.phone || "00000000000",
+          redirectUrl,
+          paymentType: "card",
+          meta: { userId, phase: profile.current_phase || "Active Plan", isRecurringPlan: true }
+        });
+        charge = initiated.data || initiated;
+        chargeId = charge?.id || null;
+        if (isSandboxMode() && charge?.status === "pending" && chargeId) {
+          const completed = await completeSandboxCharge(chargeId);
+          charge = completed.charge;
+        }
+      }
+      if (!chargeId) {
+        results.push({ userId, status: "failed", message: "No charge id returned" });
+        continue;
+      }
+      pendingCharges.set(reference, {
+        chargeId,
+        userId,
+        amount,
+        phase: profile.current_phase || "Active Plan",
+        isRecurringPlan: true,
+        email: profile.email,
+        name: profile.name || "Investor"
+      });
+      if (isChargeSucceeded(charge?.status)) {
+        await creditVerifiedPayment({
+          userId,
+          email: profile.email,
+          name: profile.name,
+          verifiedAmount: amount,
+          phase: profile.current_phase || "Active Plan",
+          isRecurringPlan: true,
+          txRef: reference,
+          flwRef: String(chargeId),
+          cardToken: charge?.payment_method?.id || card?.flutterwave_card_token || null,
+          customerId: charge?.customer?.id || card?.flutterwave_customer_id || null,
+          cardLast4: charge?.payment_method?.card?.last4 || card?.card_last4 || "****",
+          cardBrand: charge?.payment_method?.card?.network || card?.card_brand || "Card"
+        });
+        const next = /* @__PURE__ */ new Date();
+        next.setMonth(next.getMonth() + 1);
+        plan.next_charge_date = next.toISOString().split("T")[0];
+        const rem = new Date(next);
+        rem.setDate(rem.getDate() - 1);
+        plan.reminder_date = rem.toISOString().split("T")[0];
+        plan.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+        store.auto_debit_plans.set(userId, plan);
+        results.push({ userId, status: "charged", reference });
+      } else {
+        results.push({ userId, status: "pending", reference, message: charge?.status || "awaiting authorization" });
+      }
+    } catch (err) {
+      results.push({ userId, status: "failed", message: err.message || "Charge failed" });
+    }
+  }
+  res.json({ success: true, processed: results.length, results });
 });
 app.post("/api/investor/auto-debit-reminders", (_req, res) => {
   const today = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
@@ -1297,7 +1551,8 @@ async function creditVerifiedPayment(params) {
     flwRef,
     cardLast4 = "****",
     cardBrand = "Card",
-    cardToken = null
+    cardToken = null,
+    customerId = null
   } = params;
   const verifiedCustomerEmail = (email || "").toLowerCase().trim();
   const verifiedCustomerName = name || "Investor";
@@ -1358,6 +1613,7 @@ async function creditVerifiedPayment(params) {
     const cardRecord = {
       user_id: effectiveUserId,
       flutterwave_card_token: cardToken,
+      flutterwave_customer_id: customerId || null,
       card_last4: cardLast4,
       card_brand: cardBrand,
       card_exp_month: "12",
@@ -1369,18 +1625,40 @@ async function creditVerifiedPayment(params) {
       store.card_details.set(userId, cardRecord);
     }
   }
+  if (isRecurringPlan && verifiedAmount > 0) {
+    const now2 = /* @__PURE__ */ new Date();
+    const nextCharge = new Date(now2.getFullYear(), now2.getMonth() + 1, now2.getDate()).toISOString().split("T")[0];
+    const reminder = new Date(now2.getFullYear(), now2.getMonth() + 1, now2.getDate() - 1).toISOString().split("T")[0];
+    const plan = {
+      user_id: effectiveUserId,
+      amount: verifiedAmount,
+      active: true,
+      next_charge_date: nextCharge,
+      reminder_date: reminder,
+      last_reminder_sent: null,
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    store.auto_debit_plans.set(effectiveUserId, plan);
+    if (userId && userId !== effectiveUserId) {
+      store.auto_debit_plans.set(userId, plan);
+    }
+    profile.payment_plan_id = profile.payment_plan_id || `plan_flw_${Date.now()}`;
+    store.profiles.set(effectiveUserId, profile);
+  }
   let investment = store.investments.get(effectiveUserId) || (userId ? store.investments.get(userId) : null);
   const now = /* @__PURE__ */ new Date();
-  const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString().split("T")[0];
   if (investment) {
     if (!existingPayment) {
       investment.amount = Number(investment.amount) + verifiedAmount;
-      investment.cycle_count = (investment.cycle_count || 0) + 1;
     }
     investment.phase = targetPhase;
     investment.type = isRecurringPlan ? "auto" : investment.type;
     investment.status = "active";
-    investment.next_payment_date = nextMonth;
+    ensureInvestmentPayoutSchedule(investment);
+    if (!investment.next_payment_date) {
+      investment.next_payment_date = addDaysIso(now, 14);
+    }
   } else {
     investment = {
       id: `inv-${Date.now()}`,
@@ -1389,10 +1667,12 @@ async function creditVerifiedPayment(params) {
       phase: targetPhase,
       type: isRecurringPlan ? "auto" : "one-time",
       status: "active",
-      start_date: (/* @__PURE__ */ new Date()).toISOString(),
-      next_payment_date: nextMonth,
+      start_date: now.toISOString(),
+      cycle_start_date: now.toISOString(),
+      payout_phase: "mid",
+      next_payment_date: addDaysIso(now, 14),
       cycle_count: 1,
-      created_at: (/* @__PURE__ */ new Date()).toISOString()
+      created_at: now.toISOString()
     };
   }
   store.investments.set(effectiveUserId, investment);
@@ -1590,7 +1870,8 @@ app.post("/api/flutterwave/webhook", async (req, res) => {
         flwRef: String(flwRef),
         cardLast4,
         cardBrand,
-        cardToken: data.payment_method?.id || null
+        cardToken: data.payment_method?.id || null,
+        customerId: data.customer?.id || null
       });
     }
     return res.status(200).json({ status: "success" });
@@ -1620,6 +1901,7 @@ app.post("/api/flutterwave/verify", async (req, res) => {
   let cardLast4 = "****";
   let cardBrand = "Card";
   let cardToken = null;
+  let customerId = null;
   if (!isFlutterwaveConfigured()) {
     return res.status(503).json({ message: "Flutterwave is not configured." });
   }
@@ -1641,6 +1923,7 @@ app.post("/api/flutterwave/verify", async (req, res) => {
       cardBrand = pmCard.network || pmCard.brand || cardBrand;
     }
     cardToken = charge.payment_method?.id || null;
+    customerId = charge.customer?.id || null;
   } catch (err) {
     return res.status(502).json({ message: err.message || "Failed to verify charge with Flutterwave." });
   }
@@ -1655,7 +1938,8 @@ app.post("/api/flutterwave/verify", async (req, res) => {
     flwRef: String(resolvedFlwRef),
     cardLast4,
     cardBrand,
-    cardToken
+    cardToken,
+    customerId
   });
   res.json({
     success: true,
@@ -1788,8 +2072,11 @@ app.get("/api/admin/overview", async (req, res) => {
   if (isLiveSupabase && supabaseAdmin) {
     try {
       const { data: settingsData } = await supabaseAdmin.from("platform_settings").select("*").eq("key", "payout_mode").maybeSingle();
-      if (settingsData?.value?.mode) {
-        store.platform_settings.payout_mode = settingsData.value.mode;
+      if (settingsData?.value) {
+        const parsed = parsePayoutModeValue(settingsData.value);
+        if (parsed) {
+          store.platform_settings.payout_mode = parsed;
+        }
         if (settingsData.updated_at) {
           store.platform_settings.updated_at = settingsData.updated_at;
         }
@@ -1841,12 +2128,15 @@ app.get("/api/admin/overview", async (req, res) => {
   });
   const scheduledPayouts = activeInvestments.map((inv) => {
     const profile = store.profiles.get(inv.user_id);
-    const bankDetails = store.bank_details.get(inv.user_id) || null;
+    const bankDetails = getBankDetailsForUser(inv.user_id);
+    const due = computePayoutForInvestment(inv);
     return {
       userId: inv.user_id,
       investorName: profile?.name || profile?.email || "Investor",
       investorEmail: profile?.email || "\u2014",
-      amount: Math.round(Number(inv.amount) * 0.15) || 0,
+      amount: due.amount,
+      payoutPhase: due.phase,
+      payoutLabel: due.label,
       nextPaymentDate: inv.next_payment_date,
       hasBeneficiary: Boolean(bankDetails?.account_number)
     };
@@ -2054,8 +2344,11 @@ app.get("/api/admin/payouts", async (req, res) => {
   if (isLiveSupabase && supabaseAdmin) {
     try {
       const { data: settingsData } = await supabaseAdmin.from("platform_settings").select("*").eq("key", "payout_mode").maybeSingle();
-      if (settingsData?.value?.mode) {
-        store.platform_settings.payout_mode = settingsData.value.mode;
+      if (settingsData?.value) {
+        const parsed = parsePayoutModeValue(settingsData.value);
+        if (parsed) {
+          store.platform_settings.payout_mode = parsed;
+        }
         if (settingsData.updated_at) {
           store.platform_settings.updated_at = settingsData.updated_at;
         }
@@ -2074,16 +2367,22 @@ app.get("/api/admin/payouts", async (req, res) => {
   Array.from(store.investments.values()).forEach((inv) => {
     if (inv.status !== "active" || !inv.next_payment_date) return;
     const profile = store.profiles.get(inv.user_id);
-    const bankDetails = store.bank_details.get(inv.user_id) || null;
+    const bankDetails = getBankDetailsForUser(inv.user_id);
+    const due = computePayoutForInvestment(inv);
     const userPayments = store.payments.filter((p) => p.user_id === inv.user_id && p.status === "successful");
     const hasPaidIn = userPayments.length > 0;
     const payoutItem = {
       userId: inv.user_id,
       investorName: profile?.name || profile?.email || "Investor",
       investorEmail: profile?.email || "\u2014",
-      amount: Math.round(Number(inv.amount) * 0.15) || 0,
+      amount: due.amount,
+      payoutPhase: due.phase,
+      payoutLabel: due.label,
+      interestComponent: due.interestComponent,
+      principalComponent: due.principalComponent,
       nextPaymentDate: inv.next_payment_date || todayStr,
-      hasBeneficiary: Boolean(bankDetails?.account_number),
+      hasBeneficiary: Boolean(bankDetails?.account_number && bankDetails?.bank_code),
+      bankName: bankDetails?.bank_name || null,
       bankDetails,
       hasPaidIn
     };
@@ -2111,74 +2410,111 @@ app.get("/api/admin/payouts", async (req, res) => {
   });
 });
 app.post("/api/admin/payout-mode", async (req, res) => {
-  const { mode, adminName } = req.body;
-  if (mode !== "automatic" && mode !== "manual") {
-    return res.status(400).json({ message: 'Invalid payout mode. Must be "automatic" or "manual".' });
-  }
-  const prevMode = store.platform_settings.payout_mode;
-  const timestamp = (/* @__PURE__ */ new Date()).toISOString();
-  store.platform_settings.payout_mode = mode;
-  store.platform_settings.updated_by = adminName || "Admin";
-  store.platform_settings.updated_at = timestamp;
-  if (isLiveSupabase && supabaseAdmin) {
-    try {
-      const { error: dbError } = await supabaseAdmin.from("platform_settings").upsert(
-        {
-          key: "payout_mode",
-          value: { mode, updated_by: adminName || "Admin" },
-          updated_at: timestamp
-        },
-        { onConflict: "key" }
-      );
-      if (dbError) console.warn("payout_mode upsert notice:", dbError.message);
-    } catch (err) {
-      console.warn("Failed to persist payout_mode:", err);
+  try {
+    const { mode, adminName } = req.body || {};
+    const normalized = String(mode || "").toLowerCase().trim();
+    if (normalized !== "automatic" && normalized !== "manual") {
+      return res.status(400).json({ message: 'Invalid payout mode. Must be "automatic" or "manual".' });
     }
+    const prevMode = store.platform_settings.payout_mode;
+    const timestamp = (/* @__PURE__ */ new Date()).toISOString();
+    store.platform_settings.payout_mode = normalized;
+    store.platform_settings.updated_by = adminName || "Admin";
+    store.platform_settings.updated_at = timestamp;
+    let persisted = !isLiveSupabase;
+    if (isLiveSupabase && supabaseAdmin) {
+      try {
+        const { error: dbError } = await supabaseAdmin.from("platform_settings").upsert(
+          {
+            key: "payout_mode",
+            value: { mode: normalized, updated_by: adminName || "Admin" },
+            updated_at: timestamp
+          },
+          { onConflict: "key" }
+        );
+        if (dbError) {
+          console.warn("payout_mode upsert notice:", dbError.message);
+        } else {
+          persisted = true;
+        }
+      } catch (err) {
+        console.warn("Failed to persist payout_mode:", err);
+      }
+    }
+    store.platform_settings.payout_mode = normalized;
+    await logActivity(
+      adminName || "Admin",
+      "PAYOUT_MODE_SWITCHED",
+      `Switched platform payout mode from ${prevMode.toUpperCase()} to ${normalized.toUpperCase()}`
+    );
+    if (normalized === "automatic") {
+      for (const inv of store.investments.values()) {
+        if (inv.status !== "active") continue;
+        const bank = getBankDetailsForUser(inv.user_id);
+        if (!bank?.account_number || !bank?.bank_code) {
+          notifyInvestor(
+            inv.user_id,
+            "Update your bank details",
+            "Automatic payouts are enabled. Add a valid local bank account in your dashboard so we can send your returns. Wrong or missing details will block payouts.",
+            "alert"
+          );
+        }
+      }
+    }
+    return res.json({
+      success: true,
+      mode: normalized,
+      persisted,
+      message: `Payout mode set to ${normalized}`
+    });
+  } catch (err) {
+    console.error("payout-mode toggle error:", err);
+    return res.status(500).json({ message: err.message || "Failed to switch payout mode" });
   }
-  store.platform_settings.payout_mode = mode;
-  await logActivity(
-    adminName || "Admin",
-    "PAYOUT_MODE_SWITCHED",
-    `Switched platform payout mode from ${prevMode.toUpperCase()} to ${mode.toUpperCase()}`
-  );
-  res.json({ success: true, mode });
 });
 app.post("/api/admin/payouts/manual-pay", async (req, res) => {
   const { userId, amount, adminName, referenceNote } = req.body;
-  if (!userId || !amount || !referenceNote) {
-    return res.status(400).json({ message: "User, amount, and reference note are required" });
+  if (!userId || !referenceNote) {
+    return res.status(400).json({ message: "User and reference note are required" });
   }
+  const investment = store.investments.get(userId);
+  if (!investment || investment.status !== "active") {
+    return res.status(404).json({ message: "Active investment not found for this investor" });
+  }
+  const due = computePayoutForInvestment(investment);
+  const payAmount = Number(amount) > 0 ? Number(amount) : due.amount;
+  const bank = getBankDetailsForUser(userId);
   const payout = {
     id: `po-${Date.now()}`,
     user_id: userId,
-    amount: Number(amount),
+    amount: payAmount,
     mode: "manual",
     status: "successful",
     flutterwave_transfer_id: `MANUAL_REF_${Date.now()}`,
     processed_at: (/* @__PURE__ */ new Date()).toISOString(),
     processed_by: adminName || "Admin Ops",
-    notes: referenceNote
+    notes: `${referenceNote} \xB7 ${due.label}${bank?.bank_name ? ` \xB7 ${bank.bank_name}` : ""}`,
+    payout_phase: due.phase
   };
   store.payouts.unshift(payout);
-  const investment = store.investments.get(userId);
-  let updatedNextPaymentDate = null;
-  if (investment) {
-    const currentNext = investment.next_payment_date ? new Date(investment.next_payment_date) : /* @__PURE__ */ new Date();
-    currentNext.setDate(currentNext.getDate() + 30);
-    updatedNextPaymentDate = currentNext.toISOString().split("T")[0];
-    investment.next_payment_date = updatedNextPaymentDate;
-    store.investments.set(userId, investment);
-  }
+  advanceInvestmentAfterPayout(investment);
+  const updatedNextPaymentDate = investment.next_payment_date || null;
+  notifyInvestor(
+    userId,
+    due.phase === "mid" ? "Mid-cycle payout received" : "Month-end payout received",
+    `\u20A6${payAmount.toLocaleString()} was marked paid (${due.label}). Next payout date: ${updatedNextPaymentDate || "\u2014"}.`,
+    "check"
+  );
   if (isLiveSupabase && supabaseAdmin && isValidUUID(userId)) {
     try {
       await supabaseAdmin.from("payouts").insert({
         user_id: userId,
-        amount: Number(amount),
+        amount: payAmount,
         mode: "manual",
         status: "successful",
         flutterwave_transfer_id: payout.flutterwave_transfer_id,
         processed_at: payout.processed_at,
-        notes: referenceNote
+        notes: payout.notes
       });
       if (updatedNextPaymentDate) {
         await supabaseAdmin.from("investments").update({
@@ -2193,10 +2529,78 @@ app.post("/api/admin/payouts/manual-pay", async (req, res) => {
   await logActivity(
     adminName || "Admin",
     "MANUAL_PAYOUT_DISBURSED",
-    `Disbursed manual payout of \u20A6${Number(amount).toLocaleString()} to ${profile?.name || userId}. Note: ${referenceNote}`,
-    Number(amount)
+    `Disbursed manual ${due.phase} payout of \u20A6${payAmount.toLocaleString()} to ${profile?.name || userId}. Note: ${referenceNote}`,
+    payAmount
   );
   res.json(payout);
+});
+app.post("/api/admin/payouts/manual-batch", async (req, res) => {
+  const { userIds, payAllDue, adminName, referenceNote } = req.body || {};
+  if (!referenceNote || !String(referenceNote).trim()) {
+    return res.status(400).json({ message: "A reference note is required for manual payouts" });
+  }
+  const todayStr = (/* @__PURE__ */ new Date()).toISOString().split("T")[0];
+  let targets = [];
+  if (payAllDue) {
+    targets = Array.from(store.investments.values()).filter((inv) => inv.status === "active" && inv.next_payment_date && inv.next_payment_date <= todayStr).map((inv) => inv.user_id);
+  } else if (Array.isArray(userIds) && userIds.length > 0) {
+    targets = userIds.map(String);
+  } else {
+    return res.status(400).json({ message: "Provide userIds[] or set payAllDue=true" });
+  }
+  const results = [];
+  for (const userId of targets) {
+    const investment = store.investments.get(userId);
+    if (!investment || investment.status !== "active") {
+      results.push({ userId, status: "skipped", message: "No active investment" });
+      continue;
+    }
+    const due = computePayoutForInvestment(investment);
+    const bank = getBankDetailsForUser(userId);
+    if (!bank?.account_number || !bank?.bank_code) {
+      notifyInvestor(
+        userId,
+        "Payout blocked \u2014 wrong/missing bank details",
+        "Admin attempted a payout but your local bank details are missing or incomplete. Update Opay / First Bank / your bank account in the dashboard.",
+        "alert"
+      );
+      results.push({ userId, status: "failed", message: "Missing bank details \u2014 investor notified" });
+      continue;
+    }
+    const payout = {
+      id: `po-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
+      user_id: userId,
+      amount: due.amount,
+      mode: "manual",
+      status: "successful",
+      flutterwave_transfer_id: `MANUAL_BATCH_${Date.now()}`,
+      processed_at: (/* @__PURE__ */ new Date()).toISOString(),
+      processed_by: adminName || "Admin Ops",
+      notes: `${String(referenceNote).trim()} \xB7 ${due.label} \xB7 ${bank.bank_name || "Local bank"} \u2022\u2022\u2022\u2022${String(bank.account_number).slice(-4)}`,
+      payout_phase: due.phase
+    };
+    store.payouts.unshift(payout);
+    advanceInvestmentAfterPayout(investment);
+    notifyInvestor(
+      userId,
+      due.phase === "mid" ? "Mid-cycle payout sent" : "Month-end payout + interest sent",
+      `\u20A6${due.amount.toLocaleString()} (${due.label}) was paid to your ${bank.bank_name || "bank"} account.`,
+      "check"
+    );
+    results.push({ userId, status: "paid", amount: due.amount });
+  }
+  await logActivity(
+    adminName || "Admin",
+    "MANUAL_PAYOUT_BATCH",
+    `Batch manual payouts: ${results.filter((r) => r.status === "paid").length} paid / ${results.length} targeted. Note: ${referenceNote}`
+  );
+  res.json({
+    success: true,
+    paid: results.filter((r) => r.status === "paid").length,
+    failed: results.filter((r) => r.status === "failed").length,
+    skipped: results.filter((r) => r.status === "skipped").length,
+    results
+  });
 });
 app.post("/api/payouts/run-cron", async (req, res) => {
   const { triggeredBy } = req.body;
@@ -2221,42 +2625,95 @@ app.post("/api/payouts/run-cron", async (req, res) => {
       continue;
     }
     eligibleCount++;
-    const payoutAmount = Math.round(Number(inv.amount) * 0.15) || 5e4;
+    const due = computePayoutForInvestment(inv);
+    const payoutAmount = due.amount;
     if (currentMode === "manual") {
       queuedForManual++;
-      logs.push(`Queued ${investorName} for manual admin disbursement (\u20A6${payoutAmount.toLocaleString()}).`);
+      logs.push(`Queued ${investorName} for manual admin disbursement (\u20A6${payoutAmount.toLocaleString()} \xB7 ${due.label}).`);
       continue;
     }
-    const bankDetails = store.bank_details.get(inv.user_id);
+    const bankDetails = getBankDetailsForUser(inv.user_id);
     if (!bankDetails || !bankDetails.account_number || !bankDetails.bank_code) {
       failedTransfers++;
-      logs.push(`[FAILED] ${investorName}: No bank account on file. Skipping transfer.`);
+      notifyInvestor(
+        inv.user_id,
+        "Payout blocked \u2014 bank details missing",
+        "We could not send your automatic payout because no valid local bank account is on file. Open your dashboard \u2192 add/update bank details, then contact support if needed.",
+        "alert"
+      );
+      logs.push(`[FAILED] ${investorName}: No bank account on file. Investor notified.`);
       logActivity("Payout Automation", "PAYOUT_FAILED", `No bank account on file for ${investorName}`);
       continue;
     }
     let transferSuccessful = false;
     let transferId = `flw_trf_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    let failureReason = "Transfer could not be completed";
     if (isFlutterwaveConfigured()) {
+      let accountVerified = false;
       try {
-        const trfRef = `APEX_TRF_${Date.now()}_${inv.user_id.slice(-4)}`;
+        await resolveBankAccount(String(bankDetails.account_number), String(bankDetails.bank_code));
+        accountVerified = true;
+      } catch (err) {
+        failureReason = err.message || "Bank account verification failed";
+        if (!isSandboxMode()) {
+          failedTransfers++;
+          notifyInvestor(
+            inv.user_id,
+            "Payout blocked \u2014 wrong bank details",
+            `Automatic payout failed: ${failureReason}. Please update your local bank account number and bank in your dashboard, then try again.`,
+            "alert"
+          );
+          store.payouts.unshift({
+            id: `po-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
+            user_id: inv.user_id,
+            amount: payoutAmount,
+            mode: "automatic",
+            status: "failed",
+            flutterwave_transfer_id: null,
+            processed_at: (/* @__PURE__ */ new Date()).toISOString(),
+            processed_by: "Automated Payout Engine",
+            notes: `Bank verification failed: ${failureReason}`
+          });
+          logs.push(`[FAILED] ${investorName}: Invalid bank details \u2014 ${failureReason}`);
+          logActivity("Payout Automation", "PAYOUT_FAILED", `Invalid bank details for ${investorName}: ${failureReason}`);
+          continue;
+        }
+        logs.push(`[WARN] ${investorName}: bank resolve soft-failed in sandbox (${failureReason}) \u2014 attempting transfer`);
+      }
+      try {
+        const trfRef = `SIGMA_TRF_${Date.now()}_${String(inv.user_id).replace(/[^a-zA-Z0-9]/g, "").slice(-4)}`;
         const trfData = await createDirectTransfer({
           amount: payoutAmount,
           reference: trfRef,
-          narration: `Apex Capital Monthly Yield \u2014 ${investorName}`,
-          accountNumber: bankDetails.account_number,
-          bankCode: bankDetails.bank_code
+          narration: `SigmawealthSolution payout \u2014 ${investorName}`,
+          accountNumber: String(bankDetails.account_number),
+          bankCode: String(bankDetails.bank_code)
         });
         if (trfData?.data?.id) {
           transferSuccessful = true;
           transferId = trfData.data.id;
+        } else if (isSandboxMode()) {
+          transferSuccessful = true;
+          transferId = `sandbox_${trfRef}`;
+          logs.push(`[SANDBOX] Simulated transfer success for ${investorName} (verified=${accountVerified})`);
         } else {
-          logs.push(`Flutterwave transfer rejected: ${trfData?.message || "Unknown error"}`);
+          failureReason = trfData?.message || trfData?.error?.message || "Flutterwave rejected the transfer";
+          logs.push(`Flutterwave transfer rejected: ${failureReason}`);
         }
       } catch (err) {
-        logs.push(`Transfers API network error: ${err.message}`);
+        if (isSandboxMode()) {
+          transferSuccessful = true;
+          transferId = `sandbox_${Date.now()}`;
+          logs.push(`[SANDBOX] Transfer API error ignored for test: ${err.message}`);
+        } else {
+          failureReason = err.message || "Transfers API network error";
+          logs.push(`Transfers API network error: ${failureReason}`);
+        }
       }
     } else if (isSandboxMode()) {
       transferSuccessful = true;
+    } else {
+      failureReason = "Flutterwave is not configured for transfers";
     }
     if (transferSuccessful) {
       successfulTransfers++;
@@ -2268,23 +2725,33 @@ app.post("/api/payouts/run-cron", async (req, res) => {
         status: "successful",
         flutterwave_transfer_id: String(transferId),
         processed_at: (/* @__PURE__ */ new Date()).toISOString(),
-        processed_by: "Automated Supabase Cron Engine",
-        notes: `Automated Flutterwave transfer to ${bankDetails.bank_name} (${bankDetails.account_number.slice(-4)})`
+        processed_by: "Automated Payout Engine",
+        notes: `Automated ${due.label} to ${bankDetails.bank_name || "bank"} (\u2022\u2022\u2022\u2022${String(bankDetails.account_number).slice(-4)})`,
+        payout_phase: due.phase
       };
       store.payouts.unshift(payout);
-      const currentNext = new Date(inv.next_payment_date);
-      currentNext.setDate(currentNext.getDate() + 30);
-      inv.next_payment_date = currentNext.toISOString().split("T")[0];
-      store.investments.set(inv.user_id, inv);
+      notifyInvestor(
+        inv.user_id,
+        due.phase === "mid" ? "Mid-cycle payout sent" : "Month-end payout + interest sent",
+        `\u20A6${payoutAmount.toLocaleString()} (${due.label}) was sent to your ${bankDetails.bank_name || "bank"} account ending \u2022\u2022\u2022\u2022${String(bankDetails.account_number).slice(-4)}.`,
+        "check"
+      );
+      advanceInvestmentAfterPayout(inv);
       logActivity(
         "Payout Automation",
         "AUTOMATIC_PAYOUT_SUCCESS",
-        `Disbursed \u20A6${payoutAmount.toLocaleString()} to ${investorName} (${bankDetails.bank_name}) via Flutterwave Transfer #${transferId}`,
+        `Disbursed \u20A6${payoutAmount.toLocaleString()} (${due.label}) to ${investorName} (${bankDetails.bank_name}) via Flutterwave Transfer #${transferId}`,
         payoutAmount
       );
-      logs.push(`[SUCCESS] Transferred \u20A6${payoutAmount.toLocaleString()} to ${investorName}. Next payout: ${inv.next_payment_date}`);
+      logs.push(`[SUCCESS] Transferred \u20A6${payoutAmount.toLocaleString()} (${due.label}) to ${investorName}. Next payout: ${inv.next_payment_date}`);
     } else {
       failedTransfers++;
+      notifyInvestor(
+        inv.user_id,
+        "Payout failed \u2014 check bank details",
+        `We could not complete your automatic payout (${failureReason}). Confirm your local bank details are correct in your dashboard, or contact support.`,
+        "alert"
+      );
       const payout = {
         id: `po-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
         user_id: inv.user_id,
@@ -2293,14 +2760,14 @@ app.post("/api/payouts/run-cron", async (req, res) => {
         status: "failed",
         flutterwave_transfer_id: null,
         processed_at: (/* @__PURE__ */ new Date()).toISOString(),
-        processed_by: "Automated Supabase Cron Engine",
-        notes: "Flutterwave Transfers API declined the transaction. Flagged for admin resolution."
+        processed_by: "Automated Payout Engine",
+        notes: failureReason
       };
       store.payouts.unshift(payout);
       logActivity(
         "Payout Automation",
         "AUTOMATIC_PAYOUT_FAILED",
-        `Failed automated transfer of \u20A6${payoutAmount.toLocaleString()} to ${investorName}. Flagged for manual action.`,
+        `Failed automated transfer of \u20A6${payoutAmount.toLocaleString()} to ${investorName}. ${failureReason}`,
         payoutAmount
       );
       logs.push(`[FAILED] Automatic payout failed for ${investorName}.`);
@@ -2329,6 +2796,63 @@ app.post("/api/payouts/run-cron", async (req, res) => {
     failedTransfers,
     queuedForManual,
     logs
+  });
+});
+app.post("/api/admin/dev/seed-investment", async (req, res) => {
+  if (process.env.NODE_ENV === "production" && process.env.ALLOW_DEV_SEED !== "1") {
+    return res.status(404).json({ message: "Not found" });
+  }
+  const { userId, amount, dueToday, payoutPhase } = req.body || {};
+  if (!userId || !amount || Number(amount) <= 0) {
+    return res.status(400).json({ message: "userId and positive amount are required" });
+  }
+  const profile = store.profiles.get(String(userId));
+  if (!profile) {
+    return res.status(404).json({ message: "Investor profile not found" });
+  }
+  const principal = Number(amount);
+  const now = /* @__PURE__ */ new Date();
+  const phase = payoutPhase === "final" ? "final" : "mid";
+  const nextDate = dueToday ? now.toISOString().split("T")[0] : addDaysIso(now, phase === "mid" ? 14 : 30);
+  const payment = {
+    id: `pay-seed-${Date.now()}`,
+    user_id: profile.id,
+    user_email: profile.email,
+    amount: principal,
+    method: "card",
+    flutterwave_tx_ref: `SEED_${Date.now()}`,
+    flutterwave_ref: `SEED_${Date.now()}`,
+    reference: `SEED_${Date.now()}`,
+    status: "successful",
+    notes: "Dev seed payment",
+    created_at: now.toISOString()
+  };
+  store.payments.unshift(payment);
+  profile.total_invested = Number(profile.total_invested || 0) + principal;
+  profile.current_phase = profile.current_phase || "Active Plan";
+  store.profiles.set(profile.id, profile);
+  const investment = {
+    id: `inv-seed-${Date.now()}`,
+    user_id: profile.id,
+    amount: Number(profile.total_invested) || principal,
+    phase: "Active Plan",
+    type: "one-time",
+    status: "active",
+    start_date: now.toISOString(),
+    cycle_start_date: now.toISOString(),
+    payout_phase: phase,
+    next_payment_date: nextDate,
+    cycle_count: 1,
+    created_at: now.toISOString()
+  };
+  store.investments.set(profile.id, investment);
+  if (userId !== profile.id) store.investments.set(String(userId), investment);
+  const due = computePayoutForInvestment(investment);
+  res.json({
+    success: true,
+    investment,
+    payment,
+    nextDue: due
   });
 });
 app.get("/api/admin/opay-receipts", (req, res) => {
@@ -2405,13 +2929,11 @@ app.post("/api/admin/opay-receipts/review", async (req, res) => {
       investment = store.investments.get(profile.id);
     }
     const now = /* @__PURE__ */ new Date();
-    const nextMonth = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString().split("T")[0];
     if (investment) {
       investment.amount = Number(investment.amount) + verifiedAmount;
       investment.phase = targetPhase;
       investment.status = "active";
-      investment.next_payment_date = nextMonth;
-      investment.cycle_count = (investment.cycle_count || 0) + 1;
+      ensureInvestmentPayoutSchedule(investment);
     } else {
       investment = {
         id: `inv-${Date.now()}`,
@@ -2420,10 +2942,12 @@ app.post("/api/admin/opay-receipts/review", async (req, res) => {
         phase: targetPhase,
         type: "opay",
         status: "active",
-        start_date: (/* @__PURE__ */ new Date()).toISOString(),
-        next_payment_date: nextMonth,
+        start_date: now.toISOString(),
+        cycle_start_date: now.toISOString(),
+        payout_phase: "mid",
+        next_payment_date: addDaysIso(now, 14),
         cycle_count: 1,
-        created_at: (/* @__PURE__ */ new Date()).toISOString()
+        created_at: now.toISOString()
       };
     }
     store.investments.set(receipt.user_id, investment);
@@ -2570,6 +3094,151 @@ app.post("/api/admin/notifications/send", async (req, res) => {
     `Sent alert "${notification.title}" to ${resolvedAudience === "all" ? "all investors" : `user ${targetUserId}`}`
   );
   res.json(notification);
+});
+function supportConversationMessages(conversationId) {
+  return store.support_messages.filter((m) => m.conversation_id === conversationId).sort((a, b) => new Date(a.created_at).getTime() - new Date(b.created_at).getTime());
+}
+function touchConversation(conversation, preview, from) {
+  conversation.last_message_at = (/* @__PURE__ */ new Date()).toISOString();
+  conversation.last_message_preview = preview.slice(0, 140);
+  conversation.updated_at = conversation.last_message_at;
+  if (from === "user") {
+    conversation.status = "pending";
+    conversation.unread_admin = (conversation.unread_admin || 0) + 1;
+  } else {
+    conversation.status = "active";
+    conversation.unread_user = (conversation.unread_user || 0) + 1;
+  }
+  store.support_conversations.set(conversation.id, conversation);
+}
+app.post("/api/support/conversations", (req, res) => {
+  const { guestId, userId, name, email } = req.body || {};
+  const clientKey = String(userId || guestId || "").trim();
+  if (!clientKey) {
+    return res.status(400).json({ message: "guestId or userId is required" });
+  }
+  let conversation = Array.from(store.support_conversations.values()).find(
+    (c) => c.guest_id === clientKey || c.user_id === clientKey
+  );
+  if (!conversation) {
+    conversation = {
+      id: `sup-${Date.now()}-${crypto3.randomUUID().slice(0, 8)}`,
+      guest_id: userId ? null : clientKey,
+      user_id: userId || null,
+      visitor_name: name || "Guest Investor",
+      visitor_email: email || null,
+      status: "open",
+      unread_admin: 0,
+      unread_user: 0,
+      last_message_at: (/* @__PURE__ */ new Date()).toISOString(),
+      last_message_preview: "Conversation started",
+      created_at: (/* @__PURE__ */ new Date()).toISOString(),
+      updated_at: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    store.support_conversations.set(conversation.id, conversation);
+    store.support_messages.push({
+      id: `msg-${Date.now()}-welcome`,
+      conversation_id: conversation.id,
+      sender: "admin",
+      sender_name: "Sigma Wealth Support",
+      content: "Hello! Welcome to SigmawealthSolution support. How can we assist you with your investments, payouts, or account today?",
+      status: "delivered",
+      created_at: (/* @__PURE__ */ new Date()).toISOString()
+    });
+  } else if (name || email) {
+    if (name) conversation.visitor_name = name;
+    if (email) conversation.visitor_email = email;
+    store.support_conversations.set(conversation.id, conversation);
+  }
+  res.json({
+    conversation,
+    messages: supportConversationMessages(conversation.id)
+  });
+});
+app.get("/api/support/conversations/:id", (req, res) => {
+  const conversation = store.support_conversations.get(String(req.params.id));
+  if (!conversation) return res.status(404).json({ message: "Conversation not found" });
+  const since = req.query.since ? String(req.query.since) : null;
+  let messages = supportConversationMessages(conversation.id);
+  if (since) {
+    const sinceTs = new Date(since).getTime();
+    messages = messages.filter((m) => new Date(m.created_at).getTime() > sinceTs);
+  }
+  const typing = store.support_typing.get(conversation.id);
+  const typingActive = typing && Date.now() - typing.at < 4e3 ? typing : null;
+  if (req.query.as === "admin") {
+    conversation.unread_admin = 0;
+  } else if (req.query.as === "user") {
+    conversation.unread_user = 0;
+  }
+  store.support_conversations.set(conversation.id, conversation);
+  res.json({
+    conversation,
+    messages: since ? messages : supportConversationMessages(conversation.id),
+    typing: typingActive
+  });
+});
+app.get("/api/support/admin/conversations", (_req, res) => {
+  const list = Array.from(store.support_conversations.values()).sort(
+    (a, b) => new Date(b.last_message_at || 0).getTime() - new Date(a.last_message_at || 0).getTime()
+  );
+  res.json({
+    conversations: list,
+    pendingCount: list.filter((c) => c.status === "pending" || (c.unread_admin || 0) > 0).length
+  });
+});
+app.post("/api/support/conversations/:id/messages", (req, res) => {
+  const conversation = store.support_conversations.get(String(req.params.id));
+  if (!conversation) return res.status(404).json({ message: "Conversation not found" });
+  const { content, sender, senderName } = req.body || {};
+  const text = String(content || "").trim().slice(0, 4e3);
+  if (!text) return res.status(400).json({ message: "Message content is required" });
+  const role = sender === "admin" ? "admin" : "user";
+  const safeName = String(
+    role === "admin" ? senderName || "Sigma Wealth Support" : senderName || conversation.visitor_name || "Guest"
+  ).replace(/[<>]/g, "").slice(0, 80);
+  const message = {
+    id: `msg-${Date.now()}-${crypto3.randomUUID().slice(0, 6)}`,
+    conversation_id: conversation.id,
+    sender: role,
+    sender_name: safeName,
+    content: text,
+    status: role === "user" ? "pending" : "delivered",
+    created_at: (/* @__PURE__ */ new Date()).toISOString()
+  };
+  store.support_messages.push(message);
+  touchConversation(conversation, text, role);
+  store.support_typing.delete(conversation.id);
+  if (role === "admin") {
+    for (const m of store.support_messages) {
+      if (m.conversation_id === conversation.id && m.sender === "user" && m.status === "pending") {
+        m.status = "delivered";
+      }
+    }
+  }
+  res.json({ message, conversation });
+});
+app.post("/api/support/conversations/:id/typing", (req, res) => {
+  const conversation = store.support_conversations.get(String(req.params.id));
+  if (!conversation) return res.status(404).json({ message: "Conversation not found" });
+  const role = req.body?.role === "admin" ? "admin" : "user";
+  const name = req.body?.name || (role === "admin" ? "Sigma Wealth Support" : conversation.visitor_name || "Guest");
+  if (req.body?.typing === false) {
+    store.support_typing.delete(conversation.id);
+  } else {
+    store.support_typing.set(conversation.id, { role, name, at: Date.now() });
+  }
+  res.json({ success: true });
+});
+app.patch("/api/support/conversations/:id", (req, res) => {
+  const conversation = store.support_conversations.get(String(req.params.id));
+  if (!conversation) return res.status(404).json({ message: "Conversation not found" });
+  if (req.body?.status) {
+    conversation.status = String(req.body.status);
+  }
+  conversation.updated_at = (/* @__PURE__ */ new Date()).toISOString();
+  store.support_conversations.set(conversation.id, conversation);
+  res.json({ conversation });
 });
 async function hydrateAdminAllowlist() {
   if (!isLiveSupabase || !supabaseAdmin) return;

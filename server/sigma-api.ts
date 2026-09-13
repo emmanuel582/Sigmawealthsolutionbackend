@@ -1,6 +1,7 @@
 import express, { Request, Response, NextFunction } from 'express';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
@@ -3250,6 +3251,129 @@ app.post('/api/admin/notifications/send', async (req: Request, res: Response) =>
 
 // ---------------- LIVE SUPPORT CHAT API ----------------
 
+const SUPPORT_STORE_PATH = path.join(process.cwd(), 'data', 'support-store.json');
+
+function persistSupportToDisk() {
+  try {
+    const dir = path.dirname(SUPPORT_STORE_PATH);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const payload = {
+      conversations: Array.from(store.support_conversations.values()),
+      messages: store.support_messages,
+      saved_at: new Date().toISOString(),
+    };
+    fs.writeFileSync(SUPPORT_STORE_PATH, JSON.stringify(payload), 'utf8');
+  } catch (err) {
+    console.warn('Failed to persist support chat to disk:', err);
+  }
+}
+
+function loadSupportFromDisk() {
+  try {
+    if (!fs.existsSync(SUPPORT_STORE_PATH)) return;
+    const raw = fs.readFileSync(SUPPORT_STORE_PATH, 'utf8');
+    const data = JSON.parse(raw);
+    if (Array.isArray(data.conversations)) {
+      for (const c of data.conversations) {
+        if (c?.id) store.support_conversations.set(c.id, c);
+      }
+    }
+    if (Array.isArray(data.messages)) {
+      store.support_messages = data.messages;
+    }
+    console.log(
+      `Restored support chat: ${store.support_conversations.size} conversations, ${store.support_messages.length} messages`
+    );
+  } catch (err) {
+    console.warn('Failed to load support chat from disk:', err);
+  }
+}
+
+async function hydrateSupportFromSupabase() {
+  if (!isLiveSupabase || !supabaseAdmin) return;
+  try {
+    const { data: conversations, error: cErr } = await supabaseAdmin
+      .from('support_conversations')
+      .select('*')
+      .order('updated_at', { ascending: false })
+      .limit(500);
+    if (cErr) {
+      // Table may not exist yet — disk fallback still works
+      console.warn('support_conversations hydrate skipped:', cErr.message);
+      return;
+    }
+    const { data: messages, error: mErr } = await supabaseAdmin
+      .from('support_messages')
+      .select('*')
+      .order('created_at', { ascending: true })
+      .limit(5000);
+    if (mErr) {
+      console.warn('support_messages hydrate skipped:', mErr.message);
+      return;
+    }
+    for (const c of conversations || []) {
+      if (c?.id) store.support_conversations.set(c.id, c);
+    }
+    if (messages?.length) {
+      const byId = new Map(store.support_messages.map((m) => [m.id, m]));
+      for (const m of messages) {
+        if (m?.id) byId.set(m.id, m);
+      }
+      store.support_messages = Array.from(byId.values());
+    }
+    persistSupportToDisk();
+  } catch (err) {
+    console.warn('Could not hydrate support chat from Supabase:', err);
+  }
+}
+
+async function persistSupportConversation(conversation: any) {
+  persistSupportToDisk();
+  if (!isLiveSupabase || !supabaseAdmin || !conversation?.id) return;
+  try {
+    await supabaseAdmin.from('support_conversations').upsert(
+      {
+        id: conversation.id,
+        guest_id: conversation.guest_id,
+        user_id: conversation.user_id,
+        visitor_name: conversation.visitor_name,
+        visitor_email: conversation.visitor_email,
+        status: conversation.status,
+        unread_admin: conversation.unread_admin || 0,
+        unread_user: conversation.unread_user || 0,
+        last_message_at: conversation.last_message_at,
+        last_message_preview: conversation.last_message_preview,
+        created_at: conversation.created_at,
+        updated_at: conversation.updated_at || new Date().toISOString(),
+      },
+      { onConflict: 'id' }
+    );
+  } catch (err) {
+    console.warn('Failed to upsert support conversation:', err);
+  }
+}
+
+async function persistSupportMessage(message: any) {
+  persistSupportToDisk();
+  if (!isLiveSupabase || !supabaseAdmin || !message?.id) return;
+  try {
+    await supabaseAdmin.from('support_messages').upsert(
+      {
+        id: message.id,
+        conversation_id: message.conversation_id,
+        sender: message.sender,
+        sender_name: message.sender_name,
+        content: message.content,
+        status: message.status || 'delivered',
+        created_at: message.created_at,
+      },
+      { onConflict: 'id' }
+    );
+  } catch (err) {
+    console.warn('Failed to upsert support message:', err);
+  }
+}
+
 function supportConversationMessages(conversationId: string) {
   return store.support_messages
     .filter((m) => m.conversation_id === conversationId)
@@ -3268,18 +3392,25 @@ function touchConversation(conversation: any, preview: string, from: 'user' | 'a
     conversation.unread_user = (conversation.unread_user || 0) + 1;
   }
   store.support_conversations.set(conversation.id, conversation);
+  void persistSupportConversation(conversation);
 }
 
 app.post('/api/support/conversations', (req: Request, res: Response) => {
-  const { guestId, userId, name, email } = req.body || {};
+  const { guestId, userId, name, email, conversationId } = req.body || {};
   const clientKey = String(userId || guestId || '').trim();
-  if (!clientKey) {
+  const requestedId = conversationId ? String(conversationId).trim() : '';
+
+  let conversation =
+    (requestedId && store.support_conversations.get(requestedId)) ||
+    (clientKey
+      ? Array.from(store.support_conversations.values()).find(
+          (c) => c.guest_id === clientKey || c.user_id === clientKey
+        )
+      : null);
+
+  if (!conversation && !clientKey) {
     return res.status(400).json({ message: 'guestId or userId is required' });
   }
-
-  let conversation = Array.from(store.support_conversations.values()).find(
-    (c) => c.guest_id === clientKey || c.user_id === clientKey
-  );
 
   if (!conversation) {
     conversation = {
@@ -3298,7 +3429,7 @@ app.post('/api/support/conversations', (req: Request, res: Response) => {
     };
     store.support_conversations.set(conversation.id, conversation);
 
-    store.support_messages.push({
+    const welcome = {
       id: `msg-${Date.now()}-welcome`,
       conversation_id: conversation.id,
       sender: 'admin',
@@ -3307,11 +3438,15 @@ app.post('/api/support/conversations', (req: Request, res: Response) => {
         'Hello! Welcome to SigmawealthSolution support. How can we assist you with your investments, payouts, or account today?',
       status: 'delivered',
       created_at: new Date().toISOString(),
-    });
+    };
+    store.support_messages.push(welcome);
+    void persistSupportConversation(conversation);
+    void persistSupportMessage(welcome);
   } else if (name || email) {
     if (name) conversation.visitor_name = name;
     if (email) conversation.visitor_email = email;
     store.support_conversations.set(conversation.id, conversation);
+    void persistSupportConversation(conversation);
   }
 
   res.json({
@@ -3340,6 +3475,7 @@ app.get('/api/support/conversations/:id', (req: Request, res: Response) => {
     conversation.unread_user = 0;
   }
   store.support_conversations.set(conversation.id, conversation);
+  void persistSupportConversation(conversation);
 
   res.json({
     conversation,
@@ -3395,7 +3531,10 @@ app.post('/api/support/conversations/:id/messages', (req: Request, res: Response
         m.status = 'delivered';
       }
     }
+    persistSupportToDisk();
   }
+
+  void persistSupportMessage(message);
 
   res.json({ message, conversation });
 });
@@ -3427,6 +3566,7 @@ app.patch('/api/support/conversations/:id', (req: Request, res: Response) => {
   }
   conversation.updated_at = new Date().toISOString();
   store.support_conversations.set(conversation.id, conversation);
+  void persistSupportConversation(conversation);
   res.json({ conversation });
 });
 
@@ -3449,7 +3589,9 @@ async function hydrateAdminAllowlist(): Promise<void> {
 }
 
 async function startServer() {
+  loadSupportFromDisk();
   await hydrateAdminAllowlist();
+  await hydrateSupportFromSupabase();
 
   // Local/dev fallback when Supabase allowlist is empty (matches supabase/schema.sql seed)
   if (store.admin_allowlist.size === 0) {

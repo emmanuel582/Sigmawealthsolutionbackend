@@ -378,7 +378,64 @@ function getBankDetailsForUser(userId: string) {
     const byProfile = store.bank_details.get(profile.id);
     if (byProfile?.account_number && byProfile?.bank_code) return byProfile;
   }
+  // Search aliases linked by email
+  if (profile?.email) {
+    const email = String(profile.email).toLowerCase();
+    for (const [uid, p] of store.profiles.entries()) {
+      if (p?.email && String(p.email).toLowerCase() === email) {
+        const bank = store.bank_details.get(uid) || (p.id ? store.bank_details.get(p.id) : null);
+        if (bank?.account_number && bank?.bank_code) return bank;
+      }
+    }
+  }
   return direct || null;
+}
+
+function normalizeDateOnly(value: unknown): string | null {
+  if (!value) return null;
+  const raw = String(value).trim();
+  if (!raw) return null;
+  // Accept YYYY-MM-DD or full ISO
+  const slice = raw.slice(0, 10);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(slice)) return slice;
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toISOString().slice(0, 10);
+}
+
+function isPayoutDue(nextPaymentDate: unknown, today = new Date()): boolean {
+  const due = normalizeDateOnly(nextPaymentDate);
+  if (!due) return false;
+  return due <= today.toISOString().slice(0, 10);
+}
+
+/** Deduplicate Map values that may be stored under both auth id and profile id. */
+function uniqueActiveInvestments(): any[] {
+  const byUser = new Map<string, any>();
+  for (const inv of store.investments.values()) {
+    if (!inv || inv.status !== 'active') continue;
+    const key = String(inv.user_id);
+    const prev = byUser.get(key);
+    if (!prev || Number(inv.amount || 0) >= Number(prev.amount || 0)) {
+      byUser.set(key, inv);
+    }
+  }
+  return Array.from(byUser.values());
+}
+
+function investorHasSuccessfulPayment(userId: string): boolean {
+  const ids = new Set<string>([String(userId)]);
+  const profile = store.profiles.get(userId);
+  if (profile?.id) ids.add(String(profile.id));
+  if (profile?.email) {
+    const email = String(profile.email).toLowerCase();
+    for (const [uid, p] of store.profiles.entries()) {
+      if (p?.email && String(p.email).toLowerCase() === email) ids.add(String(uid));
+    }
+  }
+  return store.payments.some(
+    (p) => ids.has(String(p.user_id)) && String(p.status).toLowerCase() === 'successful'
+  );
 }
 
 function notifyInvestor(userId: string, title: string, body: string, icon = 'alert') {
@@ -2075,12 +2132,11 @@ app.get('/api/admin/overview', async (req: Request, res: Response) => {
   const pendingOPayCount = store.opay_receipts.filter((r) => r.status === 'pending').length;
   
   const todayStr = new Date().toISOString().split('T')[0];
-  const activeInvestments = Array.from(store.investments.values()).filter(
-    (inv) => inv.status === 'active' && inv.next_payment_date
-  );
-  const payoutsDueTodayCount = activeInvestments.filter(
-    (inv) => inv.next_payment_date && inv.next_payment_date <= todayStr
-  ).length;
+  const activeInvestments = uniqueActiveInvestments().filter((inv) => {
+    ensureInvestmentPayoutSchedule(inv);
+    return Boolean(normalizeDateOnly(inv.next_payment_date));
+  });
+  const payoutsDueTodayCount = activeInvestments.filter((inv) => isPayoutDue(inv.next_payment_date)).length;
   const scheduledPayoutsCount = activeInvestments.length;
 
   const failedPayoutsCount = store.payouts.filter((p) => p.status === 'failed').length;
@@ -2429,15 +2485,17 @@ app.get('/api/admin/payouts', async (req: Request, res: Response) => {
   const dueToday: any[] = [];
   const upcoming: any[] = [];
 
-  Array.from(store.investments.values()).forEach((inv) => {
-    if (inv.status !== 'active' || !inv.next_payment_date) return;
+  uniqueActiveInvestments().forEach((inv) => {
+    ensureInvestmentPayoutSchedule(inv);
+    if (!inv.next_payment_date) {
+      inv.next_payment_date = addDaysIso(inv.cycle_start_date || new Date(), 7);
+      store.investments.set(inv.user_id, inv);
+    }
 
     const profile = store.profiles.get(inv.user_id);
     const bankDetails = getBankDetailsForUser(inv.user_id);
     const due = computePayoutForInvestment(inv);
-
-    const userPayments = store.payments.filter((p) => p.user_id === inv.user_id && p.status === 'successful');
-    const hasPaidIn = userPayments.length > 0;
+    const hasPaidIn = investorHasSuccessfulPayment(inv.user_id);
 
     const payoutItem = {
       userId: inv.user_id,
@@ -2448,14 +2506,14 @@ app.get('/api/admin/payouts', async (req: Request, res: Response) => {
       payoutLabel: due.label,
       interestComponent: due.interestComponent,
       principalComponent: due.principalComponent,
-      nextPaymentDate: inv.next_payment_date || todayStr,
+      nextPaymentDate: normalizeDateOnly(inv.next_payment_date) || todayStr,
       hasBeneficiary: Boolean(bankDetails?.account_number && bankDetails?.bank_code),
       bankName: bankDetails?.bank_name || null,
       bankDetails,
       hasPaidIn,
     };
 
-    if (inv.next_payment_date <= todayStr) {
+    if (isPayoutDue(inv.next_payment_date)) {
       dueToday.push(payoutItem);
     } else {
       upcoming.push(payoutItem);
@@ -2562,7 +2620,15 @@ app.post('/api/admin/payouts/manual-pay', async (req: Request, res: Response) =>
     return res.status(400).json({ message: 'User and reference note are required' });
   }
 
-  const investment = store.investments.get(userId);
+  // Prefer canonical profile id map entry
+  let investment = store.investments.get(String(userId));
+  if (!investment) {
+    const profile = store.profiles.get(String(userId));
+    if (profile?.id) investment = store.investments.get(String(profile.id));
+  }
+  if (!investment) {
+    investment = uniqueActiveInvestments().find((inv) => String(inv.user_id) === String(userId));
+  }
   if (!investment || investment.status !== 'active') {
     return res.status(404).json({ message: 'Active investment not found for this investor' });
   }
@@ -2639,8 +2705,8 @@ app.post('/api/admin/payouts/manual-batch', async (req: Request, res: Response) 
   let targets: string[] = [];
 
   if (payAllDue) {
-    targets = Array.from(store.investments.values())
-      .filter((inv) => inv.status === 'active' && inv.next_payment_date && inv.next_payment_date <= todayStr)
+    targets = uniqueActiveInvestments()
+      .filter((inv) => isPayoutDue(inv.next_payment_date))
       .map((inv) => inv.user_id);
   } else if (Array.isArray(userIds) && userIds.length > 0) {
     targets = userIds.map(String);
@@ -2710,16 +2776,21 @@ app.post('/api/admin/payouts/manual-batch', async (req: Request, res: Response) 
 
 // Automated Daily Cron / Edge Function Payout Runner
 app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
-  const { triggeredBy } = req.body;
-  const todayStr = new Date().toISOString().split('T')[0];
+  const { triggeredBy, adminName } = req.body || {};
   const logs: string[] = [];
   const currentMode = store.platform_settings.payout_mode;
+  const actor = adminName || triggeredBy || 'Automated Payout Engine';
 
   logs.push(`[${new Date().toISOString()}] Initiating payout cycle. Mode: ${currentMode.toUpperCase()}`);
 
-  const activeInvestments = Array.from(store.investments.values()).filter(
-    (inv) => inv.status === 'active' && inv.next_payment_date && inv.next_payment_date <= todayStr
-  );
+  const activeInvestments = uniqueActiveInvestments().filter((inv) => {
+    ensureInvestmentPayoutSchedule(inv);
+    if (!inv.next_payment_date) {
+      inv.next_payment_date = addDaysIso(inv.cycle_start_date || new Date(), 7);
+      store.investments.set(inv.user_id, inv);
+    }
+    return isPayoutDue(inv.next_payment_date);
+  });
 
   let eligibleCount = 0;
   let successfulTransfers = 0;
@@ -2730,9 +2801,7 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
     const profile = store.profiles.get(inv.user_id);
     const investorName = profile?.name || profile?.email || inv.user_id;
 
-    // Check contribution requirement: investor must have confirmed payment
-    const userPayments = store.payments.filter((p) => p.user_id === inv.user_id && p.status === 'successful');
-    if (userPayments.length === 0) {
+    if (!investorHasSuccessfulPayment(inv.user_id)) {
       logs.push(`Skipping ${investorName}: No verified contribution found in current cycle.`);
       logActivity('Payout Automation', 'PAYOUT_SKIPPED', `Skipped ${investorName} — no confirmed contribution record`);
       continue;
@@ -2791,7 +2860,7 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
             status: 'failed',
             flutterwave_transfer_id: null,
             processed_at: new Date().toISOString(),
-            processed_by: 'Automated Payout Engine',
+            processed_by: actor,
             notes: `Bank verification failed: ${failureReason}`,
           });
           logs.push(`[FAILED] ${investorName}: Invalid bank details — ${failureReason}`);
@@ -2810,11 +2879,13 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
           accountNumber: String(bankDetails.account_number),
           bankCode: String(bankDetails.bank_code),
         });
-        if (trfData?.data?.id) {
+        const trfStatus = String(trfData?.data?.status || trfData?.status || '').toLowerCase();
+        const trfId = trfData?.data?.id || trfData?.data?.transfer_id || trfData?.id;
+        const okStatuses = ['new', 'pending', 'successful', 'success', 'completed'];
+        if (trfId || okStatuses.includes(trfStatus)) {
           transferSuccessful = true;
-          transferId = trfData.data.id;
+          transferId = String(trfId || trfRef);
         } else if (isSandboxMode()) {
-          // Sandbox transfers can be flaky — still complete cycle so ops can be tested end-to-end
           transferSuccessful = true;
           transferId = `sandbox_${trfRef}`;
           logs.push(`[SANDBOX] Simulated transfer success for ${investorName} (verified=${accountVerified})`);
@@ -2832,9 +2903,11 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
           logs.push(`Transfers API network error: ${failureReason}`);
         }
       }
-    } else if (isSandboxMode()) {
+    } else if (isSandboxMode() || process.env.NODE_ENV !== 'production') {
       // Local/dev without Flutterwave credentials — simulate success so mode can be tested
       transferSuccessful = true;
+      transferId = `local_${Date.now()}`;
+      logs.push(`[LOCAL] Simulated automatic transfer for ${investorName}`);
     } else {
       failureReason = 'Flutterwave is not configured for transfers';
     }
@@ -2849,7 +2922,7 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
         status: 'successful',
         flutterwave_transfer_id: String(transferId),
         processed_at: new Date().toISOString(),
-        processed_by: 'Automated Payout Engine',
+        processed_by: actor,
         notes: `Automated ${due.label} to ${bankDetails.bank_name || 'bank'} (••••${String(bankDetails.account_number).slice(-4)})`,
         payout_phase: due.phase,
       };
@@ -2887,8 +2960,9 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
         status: 'failed',
         flutterwave_transfer_id: null,
         processed_at: new Date().toISOString(),
-        processed_by: 'Automated Payout Engine',
+        processed_by: actor,
         notes: failureReason,
+        payout_phase: due.phase,
       };
       store.payouts.unshift(payout);
       logActivity(
@@ -2912,7 +2986,7 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
   if (store.payout_batches.length > 30) store.payout_batches.pop();
 
   logActivity(
-    triggeredBy || 'Scheduled Cron',
+    actor,
     'PAYOUT_BATCH_COMPLETED',
     `Payout cycle finished. Eligible: ${eligibleCount}, Success: ${successfulTransfers}, Failed: ${failedTransfers}, Queued Manual: ${queuedForManual}`
   );

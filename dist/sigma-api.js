@@ -715,13 +715,23 @@ function notifyInvestor(userId, title, body, icon = "alert") {
   store.notifications.unshift(notification);
   return notification;
 }
+var MIN_DEPOSIT_NGN = 1e5;
+var WEEKLY_SHARE = 0.25;
 function getInterestRate() {
   const rate = Number(store.platform_settings.interest_rate);
   return Number.isFinite(rate) && rate >= 0 ? rate : 0.15;
 }
+function normalizePayoutWeek(raw) {
+  const v = String(raw || "").toLowerCase();
+  if (v === "week2" || v === "2") return 2;
+  if (v === "week3" || v === "3") return 3;
+  if (v === "week4" || v === "final" || v === "4") return 4;
+  return 1;
+}
 function ensureInvestmentPayoutSchedule(inv) {
   if (!inv) return inv;
-  if (!inv.payout_phase) inv.payout_phase = "mid";
+  const week = normalizePayoutWeek(inv.payout_phase);
+  inv.payout_phase = `week${week}`;
   if (!inv.cycle_start_date) {
     inv.cycle_start_date = inv.start_date || inv.created_at || (/* @__PURE__ */ new Date()).toISOString();
   }
@@ -730,44 +740,42 @@ function ensureInvestmentPayoutSchedule(inv) {
 function computePayoutForInvestment(inv) {
   ensureInvestmentPayoutSchedule(inv);
   const principal = Math.max(0, Number(inv.amount) || 0);
-  const phase = inv.payout_phase === "final" ? "final" : "mid";
+  const week = normalizePayoutWeek(inv.payout_phase);
   const interestRate = getInterestRate();
-  if (phase === "mid") {
-    const amount = Math.round(principal * 0.5);
+  const principalComponent = Math.round(principal * WEEKLY_SHARE);
+  if (week < 4) {
     return {
-      amount,
-      phase: "mid",
-      label: "50% mid-cycle payout",
+      amount: principalComponent,
+      phase: `week${week}`,
+      week,
+      label: `Week ${week} \xB7 25% payout`,
       interestComponent: 0,
-      principalComponent: amount
+      principalComponent
     };
   }
-  const remaining = Math.round(principal * 0.5);
   const interest = Math.round(principal * interestRate);
   return {
-    amount: remaining + interest,
-    phase: "final",
-    label: `50% + ${(interestRate * 100).toFixed(0)}% interest`,
+    amount: principalComponent + interest,
+    phase: "week4",
+    week: 4,
+    label: `Week 4 \xB7 25% + ${(interestRate * 100).toFixed(0)}% interest`,
     interestComponent: interest,
-    principalComponent: remaining
+    principalComponent
   };
 }
 function advanceInvestmentAfterPayout(inv) {
   ensureInvestmentPayoutSchedule(inv);
-  const now = /* @__PURE__ */ new Date();
-  if (inv.payout_phase !== "final") {
-    inv.payout_phase = "final";
-    const next = new Date(inv.cycle_start_date || now);
-    next.setDate(next.getDate() + 30);
-    inv.next_payment_date = next.toISOString().split("T")[0];
+  const week = normalizePayoutWeek(inv.payout_phase);
+  if (week < 4) {
+    const nextWeek = week + 1;
+    inv.payout_phase = `week${nextWeek}`;
+    inv.next_payment_date = addDaysIso(inv.cycle_start_date || /* @__PURE__ */ new Date(), nextWeek * 7);
   } else {
-    inv.payout_phase = "mid";
+    inv.payout_phase = "week1";
     inv.cycle_count = (inv.cycle_count || 0) + 1;
     const cycleStart = /* @__PURE__ */ new Date();
     inv.cycle_start_date = cycleStart.toISOString();
-    const next = new Date(cycleStart);
-    next.setDate(next.getDate() + 14);
-    inv.next_payment_date = next.toISOString().split("T")[0];
+    inv.next_payment_date = addDaysIso(cycleStart, 7);
   }
   store.investments.set(inv.user_id, inv);
   return inv;
@@ -777,6 +785,12 @@ function addDaysIso(base, days) {
   d.setDate(d.getDate() + days);
   return d.toISOString().split("T")[0];
 }
+function assertMinDeposit(amount) {
+  if (!Number.isFinite(amount) || amount < MIN_DEPOSIT_NGN) {
+    return `Minimum deposit is NGN ${MIN_DEPOSIT_NGN.toLocaleString("en-NG")}. Amounts below this are not accepted.`;
+  }
+  return null;
+}
 app.get("/api/config", (req, res) => {
   res.json({
     flutterwaveConfigured: isFlutterwaveConfigured(),
@@ -784,7 +798,8 @@ app.get("/api/config", (req, res) => {
     opayAccountName: OPAY_ACCOUNT_NAME,
     opayAccountNumber: OPAY_ACCOUNT_NUMBER,
     opayBankName: OPAY_BANK_NAME,
-    isSupabaseLive: isLiveSupabase
+    isSupabaseLive: isLiveSupabase,
+    minDepositNgn: MIN_DEPOSIT_NGN
   });
 });
 var FALLBACK_BANKS = [
@@ -1227,8 +1242,8 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
             status: "active",
             start_date: now.toISOString(),
             cycle_start_date: now.toISOString(),
-            payout_phase: "mid",
-            next_payment_date: addDaysIso(now, 14),
+            payout_phase: "week1",
+            next_payment_date: addDaysIso(now, 7),
             cycle_count: 1,
             created_at: now.toISOString()
           };
@@ -1313,8 +1328,8 @@ app.get("/api/investor/dashboard/:id", async (req, res) => {
         status: "active",
         start_date: now.toISOString(),
         cycle_start_date: now.toISOString(),
-        payout_phase: "mid",
-        next_payment_date: addDaysIso(now, 14),
+        payout_phase: "week1",
+        next_payment_date: addDaysIso(now, 7),
         cycle_count: 1,
         created_at: now.toISOString()
       };
@@ -1344,6 +1359,8 @@ app.post("/api/investor/auto-debit-plan", (req, res) => {
   if (!userId || !amount || Number(amount) <= 0) {
     return res.status(400).json({ message: "userId and a positive monthly amount are required" });
   }
+  const minErr = assertMinDeposit(Number(amount));
+  if (minErr) return res.status(400).json({ message: minErr });
   const card = store.card_details.get(userId);
   if (!card?.flutterwave_card_token) {
     return res.status(400).json({
@@ -1658,7 +1675,7 @@ async function creditVerifiedPayment(params) {
     investment.status = "active";
     ensureInvestmentPayoutSchedule(investment);
     if (!investment.next_payment_date) {
-      investment.next_payment_date = addDaysIso(now, 14);
+      investment.next_payment_date = addDaysIso(now, 7);
     }
   } else {
     investment = {
@@ -1670,8 +1687,8 @@ async function creditVerifiedPayment(params) {
       status: "active",
       start_date: now.toISOString(),
       cycle_start_date: now.toISOString(),
-      payout_phase: "mid",
-      next_payment_date: addDaysIso(now, 14),
+      payout_phase: "week1",
+      next_payment_date: addDaysIso(now, 7),
       cycle_count: 1,
       created_at: now.toISOString()
     };
@@ -1756,6 +1773,8 @@ app.post("/api/flutterwave/initiate", async (req, res) => {
   if (!email || !amount || Number(amount) <= 0) {
     return res.status(400).json({ message: "Valid email and amount are required." });
   }
+  const minErr = assertMinDeposit(Number(amount));
+  if (minErr) return res.status(400).json({ message: minErr });
   if (!isFlutterwaveConfigured()) {
     return res.status(503).json({ message: "Flutterwave is not configured." });
   }
@@ -2502,7 +2521,7 @@ app.post("/api/admin/payouts/manual-pay", async (req, res) => {
   const updatedNextPaymentDate = investment.next_payment_date || null;
   notifyInvestor(
     userId,
-    due.phase === "mid" ? "Mid-cycle payout received" : "Month-end payout received",
+    due.week === 4 ? "Week 4 payout + interest received" : `Week ${due.week} payout received`,
     `\u20A6${payAmount.toLocaleString()} was marked paid (${due.label}). Next payout date: ${updatedNextPaymentDate || "\u2014"}.`,
     "check"
   );
@@ -2584,7 +2603,7 @@ app.post("/api/admin/payouts/manual-batch", async (req, res) => {
     advanceInvestmentAfterPayout(investment);
     notifyInvestor(
       userId,
-      due.phase === "mid" ? "Mid-cycle payout sent" : "Month-end payout + interest sent",
+      due.week === 4 ? "Week 4 payout + interest sent" : `Week ${due.week} payout sent`,
       `\u20A6${due.amount.toLocaleString()} (${due.label}) was paid to your ${bank.bank_name || "bank"} account.`,
       "check"
     );
@@ -2733,7 +2752,7 @@ app.post("/api/payouts/run-cron", async (req, res) => {
       store.payouts.unshift(payout);
       notifyInvestor(
         inv.user_id,
-        due.phase === "mid" ? "Mid-cycle payout sent" : "Month-end payout + interest sent",
+        due.week === 4 ? "Week 4 payout + interest sent" : `Week ${due.week} payout sent`,
         `\u20A6${payoutAmount.toLocaleString()} (${due.label}) was sent to your ${bankDetails.bank_name || "bank"} account ending \u2022\u2022\u2022\u2022${String(bankDetails.account_number).slice(-4)}.`,
         "check"
       );
@@ -2813,8 +2832,9 @@ app.post("/api/admin/dev/seed-investment", async (req, res) => {
   }
   const principal = Number(amount);
   const now = /* @__PURE__ */ new Date();
-  const phase = payoutPhase === "final" ? "final" : "mid";
-  const nextDate = dueToday ? now.toISOString().split("T")[0] : addDaysIso(now, phase === "mid" ? 14 : 30);
+  const week = normalizePayoutWeek(payoutPhase || "week1");
+  const phase = `week${week}`;
+  const nextDate = dueToday ? now.toISOString().split("T")[0] : addDaysIso(now, week * 7);
   const payment = {
     id: `pay-seed-${Date.now()}`,
     user_id: profile.id,
@@ -2945,8 +2965,8 @@ app.post("/api/admin/opay-receipts/review", async (req, res) => {
         status: "active",
         start_date: now.toISOString(),
         cycle_start_date: now.toISOString(),
-        payout_phase: "mid",
-        next_payment_date: addDaysIso(now, 14),
+        payout_phase: "week1",
+        next_payment_date: addDaysIso(now, 7),
         cycle_count: 1,
         created_at: now.toISOString()
       };
@@ -3393,6 +3413,7 @@ if (process.env.SIGMA_API_NO_LISTEN !== "1") {
   startServer();
 }
 export {
+  MIN_DEPOSIT_NGN,
   app,
   startServer,
   store

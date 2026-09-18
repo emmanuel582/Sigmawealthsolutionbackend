@@ -15,13 +15,20 @@ export function getAllowedOrigins(): string[] {
 }
 
 function isTrustedOrigin(origin: string): boolean {
-  if (
-    origin.includes('localhost') ||
-    origin.includes('127.0.0.1') ||
-    origin.endsWith('.vercel.app') ||
-    origin.endsWith('.onrender.com')
-  ) {
-    return true;
+  try {
+    const host = new URL(origin).hostname.toLowerCase();
+    if (
+      host === 'localhost' ||
+      host === '127.0.0.1' ||
+      host.endsWith('.vercel.app') ||
+      host.endsWith('.onrender.com') ||
+      host === 'sigmawealthsolution.com' ||
+      host.endsWith('.sigmawealthsolution.com')
+    ) {
+      return true;
+    }
+  } catch {
+    /* ignore invalid origin */
   }
   const allowed = getAllowedOrigins();
   return allowed.includes(origin) || allowed.includes('*');

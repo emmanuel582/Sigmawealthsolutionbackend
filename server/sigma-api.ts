@@ -16,6 +16,14 @@ import {
   completeSandboxCharge,
   chargeSavedPaymentMethod,
 } from './lib/flutterwaveV4.js';
+import {
+  isStripeConfigured,
+  createConnectExpressAccount,
+  createConnectOnboardingLink,
+  sendInvestorPayout,
+  getFrontendBaseUrl,
+  currencyForCountry,
+} from './lib/stripePayments.js';
 import { applySecurityMiddleware, productionErrorHandler } from './lib/security.js';
 import { sanitizeRequestBody } from './lib/sanitize.js';
 import { hashPassword, verifyPassword } from './lib/passwords.js';
@@ -1415,26 +1423,105 @@ app.post('/api/investor/auto-debit-reminders', (_req: Request, res: Response) =>
 });
 
 app.post('/api/investor/bank-details', (req: Request, res: Response) => {
-  const { userId, accountNumber, bankCode, bankName, accountName } = req.body;
-  if (!userId || !accountNumber || !bankCode || !accountName) {
-    return res.status(400).json({ message: 'Missing required bank parameters' });
+  const {
+    userId,
+    accountNumber,
+    bankCode,
+    bankName,
+    accountName,
+    country,
+    currency,
+    stripeAccountId,
+  } = req.body || {};
+  if (!userId || !accountName) {
+    return res.status(400).json({ message: 'userId and account holder name are required' });
   }
 
+  const existing = store.bank_details.get(userId) || {};
   const record = {
+    ...existing,
     user_id: userId,
-    account_number: accountNumber,
-    bank_code: bankCode,
-    bank_name: bankName,
+    account_number: accountNumber || existing.account_number || null,
+    bank_code: bankCode || existing.bank_code || null,
+    bank_name: bankName || existing.bank_name || null,
     account_name: accountName,
-    flutterwave_beneficiary_id: `bene_${Date.now()}`,
-    created_at: new Date().toISOString(),
+    country: String(country || existing.country || 'NG').toUpperCase(),
+    currency: String(currency || existing.currency || 'NGN').toUpperCase(),
+    stripe_account_id: stripeAccountId || existing.stripe_account_id || null,
+    flutterwave_beneficiary_id: existing.flutterwave_beneficiary_id || `bene_${Date.now()}`,
+    created_at: existing.created_at || new Date().toISOString(),
     updated_at: new Date().toISOString(),
   };
 
   store.bank_details.set(userId, record);
-  logActivity(accountName, 'BANK_DETAILS_SAVED', `Updated payout destination to ${bankName} (${accountNumber.slice(-4)})`);
+  logActivity(accountName, 'BANK_DETAILS_SAVED', `Updated payout destination (${record.country})`);
 
   res.json(record);
+});
+
+/** Stripe Connect — investor links local bank worldwide for automatic payouts */
+app.post('/api/investor/connect/onboard', async (req: Request, res: Response) => {
+  const { userId, email, country = 'NG', accountName } = req.body || {};
+  if (!userId || !email) {
+    return res.status(400).json({ message: 'userId and email are required' });
+  }
+  if (!isStripeConfigured()) {
+    return res.status(503).json({
+      message: 'Stripe is not configured. Set STRIPE_SECRET_KEY on Render.',
+    });
+  }
+
+  try {
+    const destCountry = String(country || 'NG').toUpperCase();
+    let bank = store.bank_details.get(userId) || {};
+    let accountId = bank.stripe_account_id;
+
+    if (!accountId) {
+      accountId = await createConnectExpressAccount({
+        email: String(email).trim(),
+        country: destCountry,
+        userId: String(userId),
+      });
+    }
+
+    const frontend = getFrontendBaseUrl();
+    const url = await createConnectOnboardingLink({
+      accountId,
+      refreshUrl: `${frontend}/dashboard?connect_refresh=1`,
+      returnUrl: `${frontend}/dashboard?connect_return=1`,
+    });
+
+    const record = {
+      ...bank,
+      user_id: userId,
+      country: destCountry,
+      currency: currencyForCountry(destCountry).toUpperCase(),
+      account_name: accountName || bank.account_name || 'Investor',
+      stripe_account_id: accountId,
+      connect_onboarding_complete: Boolean(bank.connect_onboarding_complete),
+      updated_at: new Date().toISOString(),
+      created_at: bank.created_at || new Date().toISOString(),
+    };
+    store.bank_details.set(userId, record);
+
+    if (isLiveSupabase && supabaseAdmin && /^[0-9a-f-]{36}$/i.test(String(userId))) {
+      try {
+        await supabaseAdmin.from('bank_details').upsert(record);
+      } catch (err) {
+        console.warn('Connect bank upsert notice:', err);
+      }
+    }
+
+    return res.json({
+      success: true,
+      stripeAccountId: accountId,
+      onboardingUrl: url,
+      message: 'Complete Stripe Connect to link your local bank for automatic payouts.',
+    });
+  } catch (err: any) {
+    console.error('Connect onboard error:', err);
+    return res.status(500).json({ message: err.message || 'Failed to start Stripe Connect onboarding' });
+  }
 });
 
 app.post('/api/investor/cancel-subscription', (req: Request, res: Response) => {
@@ -2817,27 +2904,50 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
       continue;
     }
 
-    // Automatic mode — pay into investor's saved local bank account via Flutterwave transfer
+    // Automatic mode — Stripe Connect Transfer to investor's local bank (worldwide)
     const bankDetails = getBankDetailsForUser(inv.user_id);
-    if (!bankDetails || !bankDetails.account_number || !bankDetails.bank_code) {
+    const stripeAccountId = bankDetails?.stripe_account_id || null;
+
+    if (!stripeAccountId && (!bankDetails?.account_number || !bankDetails?.bank_code)) {
       failedTransfers++;
       notifyInvestor(
         inv.user_id,
-        'Payout blocked — bank details missing',
-        'We could not send your automatic payout because no valid local bank account is on file. Open your dashboard → add/update bank details, then contact support if needed.',
+        'Payout blocked — connect your bank',
+        'We could not send your automatic payout. Open Me → Connect payout bank with Stripe and link your local bank (Nigeria, US, EU, UK, etc.).',
         'alert'
       );
-      logs.push(`[FAILED] ${investorName}: No bank account on file. Investor notified.`);
-      logActivity('Payout Automation', 'PAYOUT_FAILED', `No bank account on file for ${investorName}`);
+      logs.push(`[FAILED] ${investorName}: No Stripe Connect / bank on file. Investor notified.`);
+      logActivity('Payout Automation', 'PAYOUT_FAILED', `No Connect payout account for ${investorName}`);
       continue;
     }
 
     let transferSuccessful = false;
-    let transferId = `flw_trf_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
+    let transferId = `payout_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
     let failureReason = 'Transfer could not be completed';
 
-    // Validate account with Flutterwave before sending money (soft-fail in sandbox)
-    if (isFlutterwaveConfigured()) {
+    // Prefer Stripe Connect (pays connected account → their local bank in any country)
+    if (stripeAccountId && isStripeConfigured()) {
+      const stripeResult = await sendInvestorPayout({
+        amountMajor: payoutAmount,
+        currency: bankDetails?.currency || currencyForCountry(bankDetails?.country || 'NG'),
+        stripeAccountId,
+        description: `Sigmawealth ${due.label} payout`,
+        metadata: {
+          userId: String(inv.user_id),
+          phase: String(due.phase || ''),
+          week: String(due.week || ''),
+        },
+      });
+      if (stripeResult.success) {
+        transferSuccessful = true;
+        transferId = stripeResult.transferId;
+        logs.push(`[STRIPE] Transferred to Connect ${stripeAccountId} (${stripeResult.currency || 'ngn'})`);
+      } else {
+        failureReason = stripeResult.message || 'Stripe Connect transfer failed';
+        logs.push(`[STRIPE FAIL] ${investorName}: ${failureReason}`);
+      }
+    } else if (isFlutterwaveConfigured() && bankDetails?.account_number && bankDetails?.bank_code) {
+      // Legacy NG Flutterwave path only when Connect is missing
       let accountVerified = false;
       try {
         await resolveBankAccount(String(bankDetails.account_number), String(bankDetails.bank_code));
@@ -2849,71 +2959,49 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
           notifyInvestor(
             inv.user_id,
             'Payout blocked — wrong bank details',
-            `Automatic payout failed: ${failureReason}. Please update your local bank account number and bank in your dashboard, then try again.`,
+            `Automatic payout failed: ${failureReason}. Reconnect your bank with Stripe Connect.`,
             'alert'
           );
-          store.payouts.unshift({
-            id: `po-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
-            user_id: inv.user_id,
-            amount: payoutAmount,
-            mode: 'automatic',
-            status: 'failed',
-            flutterwave_transfer_id: null,
-            processed_at: new Date().toISOString(),
-            processed_by: actor,
-            notes: `Bank verification failed: ${failureReason}`,
-          });
-          logs.push(`[FAILED] ${investorName}: Invalid bank details — ${failureReason}`);
-          logActivity('Payout Automation', 'PAYOUT_FAILED', `Invalid bank details for ${investorName}: ${failureReason}`);
+          logs.push(`[FAILED] ${investorName}: ${failureReason}`);
           continue;
         }
-        logs.push(`[WARN] ${investorName}: bank resolve soft-failed in sandbox (${failureReason}) — attempting transfer`);
+        logs.push(`[SANDBOX] Bank verify soft-fail for ${investorName}: ${failureReason}`);
+        accountVerified = true;
       }
 
-      try {
-        const trfRef = `SIGMA_TRF_${Date.now()}_${String(inv.user_id).replace(/[^a-zA-Z0-9]/g, '').slice(-4)}`;
-        const trfData = await createDirectTransfer({
-          amount: payoutAmount,
-          reference: trfRef,
-          narration: `SigmawealthSolution payout — ${investorName}`,
-          accountNumber: String(bankDetails.account_number),
-          bankCode: String(bankDetails.bank_code),
-        });
-        const trfStatus = String(trfData?.data?.status || trfData?.status || '').toLowerCase();
-        const trfId = trfData?.data?.id || trfData?.data?.transfer_id || trfData?.id;
-        const okStatuses = ['new', 'pending', 'successful', 'success', 'completed'];
-        if (trfId || okStatuses.includes(trfStatus)) {
+      if (accountVerified) {
+        try {
+          const trfData = await createDirectTransfer({
+            amount: payoutAmount,
+            accountNumber: String(bankDetails.account_number),
+            bankCode: String(bankDetails.bank_code),
+            narration: `Sigmawealth ${due.label}`,
+            reference: transferId,
+          });
           transferSuccessful = true;
-          transferId = String(trfId || trfRef);
-        } else if (isSandboxMode()) {
-          transferSuccessful = true;
-          transferId = `sandbox_${trfRef}`;
-          logs.push(`[SANDBOX] Simulated transfer success for ${investorName} (verified=${accountVerified})`);
-        } else {
-          failureReason = trfData?.message || trfData?.error?.message || 'Flutterwave rejected the transfer';
-          logs.push(`Flutterwave transfer rejected: ${failureReason}`);
-        }
-      } catch (err: any) {
-        if (isSandboxMode()) {
-          transferSuccessful = true;
-          transferId = `sandbox_${Date.now()}`;
-          logs.push(`[SANDBOX] Transfer API error ignored for test: ${err.message}`);
-        } else {
-          failureReason = err.message || 'Transfers API network error';
-          logs.push(`Transfers API network error: ${failureReason}`);
+          transferId = String(trfData?.id || transferId);
+        } catch (err: any) {
+          if (isSandboxMode()) {
+            transferSuccessful = true;
+            logs.push(`[SANDBOX] Transfer API error ignored for test: ${err.message}`);
+          } else {
+            failureReason = err.message || 'Transfers API network error';
+            logs.push(`Transfers API network error: ${failureReason}`);
+          }
         }
       }
-    } else if (isSandboxMode() || process.env.NODE_ENV !== 'production') {
-      // Local/dev without Flutterwave credentials — simulate success so mode can be tested
-      transferSuccessful = true;
-      transferId = `local_${Date.now()}`;
-      logs.push(`[LOCAL] Simulated automatic transfer for ${investorName}`);
     } else {
-      failureReason = 'Flutterwave is not configured for transfers';
+      failureReason =
+        'Stripe Connect not linked. Investor must complete Connect payout onboarding for their country.';
+      logs.push(`[FAILED] ${investorName}: ${failureReason}`);
     }
 
     if (transferSuccessful) {
       successfulTransfers++;
+      const bankLabel = bankDetails?.bank_name || bankDetails?.country || 'connected bank';
+      const last4 = bankDetails?.account_number
+        ? `••••${String(bankDetails.account_number).slice(-4)}`
+        : 'Stripe Connect';
       const payout = {
         id: `po-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
         user_id: inv.user_id,
@@ -2921,9 +3009,10 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
         mode: 'automatic',
         status: 'successful',
         flutterwave_transfer_id: String(transferId),
+        stripe_transfer_id: String(transferId),
         processed_at: new Date().toISOString(),
         processed_by: actor,
-        notes: `Automated ${due.label} to ${bankDetails.bank_name || 'bank'} (••••${String(bankDetails.account_number).slice(-4)})`,
+        notes: `Automated ${due.label} via Stripe Connect → ${bankLabel} (${last4})`,
         payout_phase: due.phase,
       };
       store.payouts.unshift(payout);
@@ -2931,7 +3020,7 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
       notifyInvestor(
         inv.user_id,
         due.week === 4 ? 'Week 4 payout + interest sent' : `Week ${due.week} payout sent`,
-        `₦${payoutAmount.toLocaleString()} (${due.label}) was sent to your ${bankDetails.bank_name || 'bank'} account ending ••••${String(bankDetails.account_number).slice(-4)}.`,
+        `₦${payoutAmount.toLocaleString()} (${due.label}) was sent to your local bank via Stripe Connect.`,
         'check'
       );
 
@@ -2940,7 +3029,7 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
       logActivity(
         'Payout Automation',
         'AUTOMATIC_PAYOUT_SUCCESS',
-        `Disbursed ₦${payoutAmount.toLocaleString()} (${due.label}) to ${investorName} (${bankDetails.bank_name}) via Flutterwave Transfer #${transferId}`,
+        `Disbursed ₦${payoutAmount.toLocaleString()} (${due.label}) to ${investorName} via Stripe Connect #${transferId}`,
         payoutAmount
       );
       logs.push(`[SUCCESS] Transferred ₦${payoutAmount.toLocaleString()} (${due.label}) to ${investorName}. Next payout: ${inv.next_payment_date}`);
@@ -2948,8 +3037,8 @@ app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
       failedTransfers++;
       notifyInvestor(
         inv.user_id,
-        'Payout failed — check bank details',
-        `We could not complete your automatic payout (${failureReason}). Confirm your local bank details are correct in your dashboard, or contact support.`,
+        'Payout failed — reconnect bank',
+        `We could not complete your automatic payout (${failureReason}). Open Me → Connect payout bank with Stripe for your country.`,
         'alert'
       );
       const payout = {

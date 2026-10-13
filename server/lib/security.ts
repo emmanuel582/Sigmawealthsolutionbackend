@@ -10,28 +10,12 @@ export function getAllowedOrigins(): string[] {
     .map((s) => s.trim())
     .filter(Boolean);
   const appUrl = (process.env.APP_URL || process.env.FRONTEND_URL || '').replace(/\/$/, '');
-  const defaults = ['http://localhost:3000', 'http://127.0.0.1:3000'];
+  const defaults = process.env.NODE_ENV === 'production' ? ['https://sigmawealthsolution.com'] : ['http://localhost:3000', 'http://127.0.0.1:3000'];
   return Array.from(new Set([...defaults, ...fromEnv, ...(appUrl ? [appUrl] : [])]));
 }
 
 function isTrustedOrigin(origin: string): boolean {
-  try {
-    const host = new URL(origin).hostname.toLowerCase();
-    if (
-      host === 'localhost' ||
-      host === '127.0.0.1' ||
-      host.endsWith('.vercel.app') ||
-      host.endsWith('.onrender.com') ||
-      host === 'sigmawealthsolution.com' ||
-      host.endsWith('.sigmawealthsolution.com')
-    ) {
-      return true;
-    }
-  } catch {
-    /* ignore invalid origin */
-  }
-  const allowed = getAllowedOrigins();
-  return allowed.includes(origin) || allowed.includes('*');
+  return getAllowedOrigins().includes(origin);
 }
 
 export function applySecurityMiddleware(app: Express): void {
@@ -77,12 +61,11 @@ export function applySecurityMiddleware(app: Express): void {
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Support-Token', 'X-Requested-With', 'Accept', 'Origin'],
       maxAge: 600,
     })
   );
 
-  app.options('*', cors());
 
   app.use(
     '/api/',
@@ -120,7 +103,7 @@ export function applySecurityMiddleware(app: Express): void {
     legacyHeaders: false,
     message: { message: 'Too many payment attempts. Please try again later.' },
   });
-  app.use('/api/flutterwave/', paymentLimiter);
+  app.use('/api/bachs/', paymentLimiter);
   app.use('/api/payouts/', paymentLimiter);
 }
 
@@ -136,6 +119,10 @@ export function productionErrorHandler(
   if (!isProd) console.error(err.stack);
   if (err.message === 'Not allowed by CORS') {
     res.status(403).json({ message: 'Origin not allowed' });
+    return;
+  }
+  if ((err as any).type === 'entity.parse.failed' || (err as any).status === 413) {
+    res.status((err as any).status === 413 ? 413 : 400).json({ message: 'Invalid request body.' });
     return;
   }
   res.status(500).json({

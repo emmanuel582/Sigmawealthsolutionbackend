@@ -1,10 +1,29 @@
 services:
   - type: web
     name: sigmawealth-backend
-    env: node
+    runtime: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm ci --include=dev && npm prune --omit=dev
     startCommand: npm start
+    healthCheckPath: /health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: FRONTEND_URL
+        value: https://sigmawealthsolution.com
+      - key: PUBLIC_API_URL
+        value: https://sigmawealthsolutionbackend.onrender.com
+      - key: BACHS_API_KEY
+        sync: false
+      - key: BACHS_WEBHOOK_SECRET
+        sync: false
+      - key: BACHS_CRON_SECRET
+        sync: false
+      - key: BACHS_BUSINESS_APPROVED
+        value: '0'
+      - key: BACHS_AUTOMATION_ENABLED
+        value: '0'
+      - key: NEXT_PUBLIC_SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false

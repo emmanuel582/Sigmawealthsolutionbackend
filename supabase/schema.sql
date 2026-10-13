@@ -38,22 +38,22 @@ INSERT INTO public.admin_allowlist (email)
 VALUES ('cmyrachrist72@gmail.com')
 ON CONFLICT (email) DO NOTHING;
 
--- 3. BANK DETAILS TABLE (For Payouts / Flutterwave Beneficiaries)
+-- 3. BANK DETAILS TABLE (For Payouts / Bachs destinations)
 CREATE TABLE IF NOT EXISTS public.bank_details (
   user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   account_number TEXT NOT NULL,
   bank_code TEXT NOT NULL,
   bank_name TEXT NOT NULL,
   account_name TEXT NOT NULL,
-  flutterwave_beneficiary_id TEXT,
+  bachs_destination_id TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
--- 4. CARD DETAILS TABLE (Tokenized via Flutterwave â€” NEVER stores full card numbers)
+-- 4. CARD DETAILS TABLE (Tokenized via Bachs â€” NEVER stores full card numbers)
 CREATE TABLE IF NOT EXISTS public.card_details (
   user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
-  flutterwave_card_token TEXT NOT NULL,
+  bachs_payment_method_id TEXT NOT NULL,
   card_last4 TEXT NOT NULL,
   card_brand TEXT NOT NULL,
   card_exp_month TEXT,
@@ -82,7 +82,7 @@ CREATE TABLE IF NOT EXISTS public.payments (
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   amount NUMERIC(15, 2) NOT NULL,
   method TEXT NOT NULL CHECK (method IN ('card', 'card_token', 'auto_debit', 'opay_transfer')),
-  flutterwave_tx_ref TEXT UNIQUE,
+  provider_reference TEXT UNIQUE,
   status TEXT NOT NULL CHECK (status IN ('successful', 'pending', 'failed')),
   notes TEXT,
   created_at TIMESTAMPTZ DEFAULT NOW()
@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS public.payouts (
   amount NUMERIC(15, 2) NOT NULL,
   mode TEXT NOT NULL CHECK (mode IN ('automatic', 'manual')),
   status TEXT NOT NULL CHECK (status IN ('successful', 'pending', 'failed')),
-  flutterwave_transfer_id TEXT,
+  provider_transfer_id TEXT,
   processed_at TIMESTAMPTZ DEFAULT NOW(),
   processed_by TEXT,
   notes TEXT
@@ -193,17 +193,12 @@ BEGIN
   RETURN EXISTS (
     SELECT 1 
     FROM public.user_roles ur
-    LEFT JOIN public.profiles p ON p.id = ur.user_id
-    LEFT JOIN auth.users u ON u.id = ur.user_id
-    JOIN public.admin_allowlist al ON (
-      LOWER(al.email) = LOWER(p.email) OR 
-      LOWER(al.email) = LOWER(u.email) OR
-      LOWER(al.email) = LOWER(COALESCE(auth.jwt()->>'email', ''))
-    )
-    WHERE ur.user_id = _user_id AND ur.role = 'admin'
+    JOIN auth.users u ON u.id = ur.user_id
+    JOIN public.admin_allowlist al ON LOWER(al.email) = LOWER(u.email)
+    WHERE ur.user_id = _user_id AND ur.role = 'admin' AND u.email_confirmed_at IS NOT NULL
   );
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public;
 
 -- Helper function to check role from user_roles table securely
 CREATE OR REPLACE FUNCTION public.has_role(_user_id uuid, _role text)

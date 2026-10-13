@@ -1,0 +1,135 @@
+{
+  "testedAt": "2026-10-13T10:24:15.981Z",
+  "realProvider": true,
+  "moneyMoved": false,
+  "checkouts": [
+    {
+      "amount": 64000,
+      "passed": false,
+      "code": "ACCOUNT_NOT_ACTIVATED",
+      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+    },
+    {
+      "amount": 98550,
+      "passed": false,
+      "code": "ACCOUNT_NOT_ACTIVATED",
+      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+    },
+    {
+      "amount": 135000,
+      "passed": false,
+      "code": "ACCOUNT_NOT_ACTIVATED",
+      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+    },
+    {
+      "amount": 540000,
+      "passed": false,
+      "code": "ACCOUNT_NOT_ACTIVATED",
+      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+    },
+    {
+      "amount": 2160000,
+      "passed": false,
+      "code": "ACCOUNT_NOT_ACTIVATED",
+      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+    }
+  ],
+  "deployment": [
+    {
+      "base": "https://sigmawealthsolution.com",
+      "checks": [
+        {
+          "path": "/api/config",
+          "status": 200
+        },
+        {
+          "path": "/api/admin/overview",
+          "status": 200,
+          "protected": false
+        }
+      ]
+    },
+    {
+      "base": "https://sigmawealthsolutionbackend.onrender.com",
+      "checks": [
+        {
+          "path": "/api/config",
+          "status": 200
+        },
+        {
+          "path": "/api/admin/overview",
+          "status": 200,
+          "protected": false
+        }
+      ]
+    }
+  ],
+  "account": {
+    "active": true,
+    "capabilities": [
+      "conversions"
+    ],
+    "connectActive": false
+  },
+  "checkoutSettings": {
+    "feePreference": "org_pays",
+    "enabledPaymentMethods": {
+      "NGN_BANK_TRANSFER": {
+        "enabled": true
+      },
+      "MOMO_GHS": {
+        "enabled": true
+      },
+      "MOMO_KES": {
+        "enabled": true
+      },
+      "MOMO_TZS": {
+        "enabled": true
+      },
+      "MOMO_UGX": {
+        "enabled": true
+      },
+      "MOMO_XAF": {
+        "enabled": true
+      },
+      "MOMO_XOF": {
+        "enabled": true
+      },
+      "MOMO_RWF": {
+        "enabled": true
+      },
+      "MOMO_MWK": {
+        "enabled": true
+      },
+      "MOMO_ZMW": {
+        "enabled": true
+      },
+      "CRYPTO": {
+        "enabled": true,
+        "currencies": {
+          "BNB_BEP20": true,
+          "CELO_CELO": true,
+          "ETH_BASE": true,
+          "ETH_ETH": true,
+          "SOL_SOL": true,
+          "USDC_BASE": true,
+          "USDC_BEP20": true,
+          "USDC_CELO": true,
+          "USDC_ERC20": true,
+          "USDC_SOL": true,
+          "USDT_BEP20": true,
+          "USDT_CELO": true,
+          "USDT_ERC20": true,
+          "USDT_SOL": true,
+          "USDT_TRC20": true
+        }
+      },
+      "USD_CARD": {
+        "enabled": true
+      },
+      "NGN_CARD": {
+        "enabled": true
+      }
+    }
+  }
+}

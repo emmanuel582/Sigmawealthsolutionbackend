@@ -4,14 +4,20 @@
     "module": "NodeNext",
     "moduleResolution": "NodeNext",
     "esModuleInterop": true,
-    "strict": false,
+    "strict": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "outDir": "./dist",
-    "rootDir": "./server"
+    "noEmit": true
   },
   "include": [
-    "server/**/*"
+    "server/**/*.ts",
+    "lib/**/*.ts",
+    "tests/**/*.ts",
+    "scripts/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist"
   ]
 }

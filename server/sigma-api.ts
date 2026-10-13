@@ -5,28 +5,14 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
-import {
-  isFlutterwaveConfigured,
-  isSandboxMode,
-  initiateDirectCharge,
-  getCharge,
-  getBanks,
-  resolveBankAccount,
-  createDirectTransfer,
-  completeSandboxCharge,
-  chargeSavedPaymentMethod,
-} from './lib/flutterwaveV4.js';
-import {
-  isStripeConfigured,
-  createConnectExpressAccount,
-  createConnectOnboardingLink,
-  sendInvestorPayout,
-  getFrontendBaseUrl,
-  currencyForCountry,
-} from './lib/stripePayments.js';
+import { mountBachsRoutes } from './lib/bachsRoutes.js';
+import { mountAuthorization, isApprovedAdmin } from './lib/authorization.js';
+import { FUNDING_PLAN_AMOUNTS } from '../lib/sigma/fundingPlans.js';
+import { normalizeCurrency } from './lib/money.js';
+const PAYMENT_CURRENCY = 'ngn';
+const MIN_DEPOSIT_NGN = FUNDING_PLAN_AMOUNTS[0];
 import { applySecurityMiddleware, productionErrorHandler } from './lib/security.js';
 import { sanitizeRequestBody } from './lib/sanitize.js';
-import { hashPassword, verifyPassword } from './lib/passwords.js';
 
 dotenv.config();
 
@@ -37,7 +23,17 @@ const app = express();
 const PORT = Number(process.env.PORT || process.env.SIGMA_API_PORT || 4000);
 
 applySecurityMiddleware(app);
-app.use(express.json({ limit: '10mb' }));
+
+// Preserve exact Bachs webhook bytes before JSON parsing and sanitization.
+
+app.use(express.json({
+  limit: '10mb',
+  verify: (req: any, _res, buf) => {
+    if (req.originalUrl?.startsWith('/api/bachs/webhook')) {
+      req.rawBody = buf;
+    }
+  },
+}));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(sanitizeRequestBody);
 
@@ -59,8 +55,6 @@ app.get('/health', (req: Request, res: Response) => {
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.VITE_SUPABASE_URL || '';
 // Never fall back to the public anon key for admin operations
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-const FLUTTERWAVE_ENCRYPTION_KEY = process.env.FLUTTERWAVE_ENCRYPTION_KEY || '';
-const FLUTTERWAVE_WEBHOOK_SECRET = process.env.FLUTTERWAVE_WEBHOOK_SECRET || process.env.FLUTTERWAVE_SECRET_HASH || '';
 
 const OPAY_ACCOUNT_NAME = process.env.OPAY_ACCOUNT_NAME || '';
 const OPAY_ACCOUNT_NUMBER = process.env.OPAY_ACCOUNT_NUMBER || '';
@@ -84,7 +78,7 @@ function isValidUUID(id: unknown): id is string {
 }
 
 // ---------------- LOCAL IN-MEMORY / POSTGRES DATA LAYER ----------------
-// When live Supabase is connected, live SQL is queried. 
+// When live Supabase is connected, live SQL is queried.
 // When in sandbox mode, state is maintained with empty/clean initial state as required.
 interface LocalStore {
   profiles: Map<string, any>;
@@ -103,24 +97,10 @@ interface LocalStore {
   current_session: any | null;
   referrals: any[];
   auto_debit_plans: Map<string, any>;
-  auth_credentials: Map<string, string>;
   support_conversations: Map<string, any>;
   support_messages: any[];
   support_typing: Map<string, { role: string; name: string; at: number }>;
 }
-
-const pendingCharges = new Map<
-  string,
-  {
-    chargeId: string;
-    userId: string;
-    amount: number;
-    phase: string;
-    isRecurringPlan: boolean;
-    email: string;
-    name: string;
-  }
->();
 
 const store: LocalStore = {
   profiles: new Map(),
@@ -144,11 +124,17 @@ const store: LocalStore = {
   current_session: null,
   referrals: [],
   auto_debit_plans: new Map(),
-  auth_credentials: new Map(),
   support_conversations: new Map(),
   support_messages: [],
   support_typing: new Map(),
 };
+
+mountAuthorization(app, supabaseAdmin, store.support_conversations);
+mountBachsRoutes(app, supabaseAdmin, store);
+
+function hasValidPayoutDestination(bank: any): boolean {
+  return Boolean(bank?.bachs_account_id && bank?.payouts_enabled && bank?.bachs_destination_id);
+}
 
 function makeReferralCode(userId: string): string {
   const seed = String(userId).replace(/[^a-zA-Z0-9]/g, '').slice(-8).toUpperCase() || 'SIGMA';
@@ -163,42 +149,6 @@ function ensureReferralCode(profile: any): string {
   return profile.referral_code;
 }
 
-function findProfileByReferralCode(code: string): any | null {
-  const clean = String(code || '').trim().toUpperCase();
-  if (!clean) return null;
-  for (const p of store.profiles.values()) {
-    if (String(p.referral_code || '').toUpperCase() === clean) return p;
-  }
-  return null;
-}
-
-function attachReferral(newProfile: any, referralCode?: string | null) {
-  if (!referralCode || newProfile.referred_by) return;
-  const referrer = findProfileByReferralCode(referralCode);
-  if (!referrer || referrer.id === newProfile.id) return;
-  newProfile.referred_by = referrer.id;
-  store.profiles.set(newProfile.id, newProfile);
-  const existing = store.referrals.find(
-    (r) => r.referred_id === newProfile.id || (r.referred_email && r.referred_email === newProfile.email)
-  );
-  if (!existing) {
-    store.referrals.unshift({
-      id: `ref-${Date.now()}`,
-      referrer_id: referrer.id,
-      referred_id: newProfile.id,
-      referred_name: newProfile.name,
-      referred_email: newProfile.email,
-      earned_total: 0,
-      created_at: new Date().toISOString(),
-    });
-  }
-  logActivity(
-    referrer.name || referrer.email,
-    'REFERRAL_SIGNUP',
-    `${newProfile.name || newProfile.email} joined via invite link`
-  );
-}
-
 function buildReferralPayload(userId: string, profile: any) {
   ensureReferralCode(profile);
   const myReferrals = store.referrals.filter((r) => r.referrer_id === userId || r.referrer_id === profile.id);
@@ -209,38 +159,6 @@ function buildReferralPayload(userId: string, profile: any) {
     referrals: myReferrals,
     autoDebitPlan: store.auto_debit_plans.get(userId) || store.auto_debit_plans.get(profile.id) || null,
   };
-}
-
-function creditReferralCommission(payerProfile: any, paymentAmount: number) {
-  if (!payerProfile?.referred_by || !paymentAmount) return;
-  const commission = Math.round(Number(paymentAmount) * 0.1);
-  if (commission <= 0) return;
-  const referrer = store.profiles.get(payerProfile.referred_by);
-  if (!referrer) return;
-  referrer.referral_earnings = Number(referrer.referral_earnings || 0) + commission;
-  store.profiles.set(referrer.id, referrer);
-  const link = store.referrals.find((r) => r.referred_id === payerProfile.id);
-  if (link) {
-    link.earned_total = Number(link.earned_total || 0) + commission;
-    link.last_earn_at = new Date().toISOString();
-  }
-  store.notifications.unshift({
-    id: `notif-ref-${Date.now()}`,
-    title: 'Referral reward credited',
-    body: `You earned ${commission.toLocaleString('en-NG', { style: 'currency', currency: 'NGN' })} (10%) from ${payerProfile.name || payerProfile.email}'s investment.`,
-    audience: 'single',
-    target_user_id: referrer.id,
-    icon: 'gift',
-    image_url: null,
-    sent_at: new Date().toISOString(),
-    delivery_status: 'delivered',
-  });
-  logActivity(
-    referrer.name || referrer.email,
-    'REFERRAL_EARNING',
-    `Earned ₦${commission.toLocaleString()} referral commission`,
-    commission
-  );
 }
 
 // Helper: Retrieve canonical investor profile by ID or email
@@ -380,19 +298,18 @@ function parsePayoutModeValue(raw: unknown): 'automatic' | 'manual' | null {
 
 function getBankDetailsForUser(userId: string) {
   const direct = store.bank_details.get(userId);
-  if (direct?.account_number && direct?.bank_code) return direct;
+  if (direct && hasValidPayoutDestination(direct)) return direct;
   const profile = store.profiles.get(userId);
   if (profile?.id && profile.id !== userId) {
     const byProfile = store.bank_details.get(profile.id);
-    if (byProfile?.account_number && byProfile?.bank_code) return byProfile;
+    if (byProfile && hasValidPayoutDestination(byProfile)) return byProfile;
   }
-  // Search aliases linked by email
   if (profile?.email) {
     const email = String(profile.email).toLowerCase();
     for (const [uid, p] of store.profiles.entries()) {
       if (p?.email && String(p.email).toLowerCase() === email) {
         const bank = store.bank_details.get(uid) || (p.id ? store.bank_details.get(p.id) : null);
-        if (bank?.account_number && bank?.bank_code) return bank;
+        if (bank && hasValidPayoutDestination(bank)) return bank;
       }
     }
   }
@@ -463,7 +380,7 @@ function notifyInvestor(userId: string, title: string, body: string, icon = 'ale
 }
 
 /** Weekly payouts: 25% of deposit each week for 4 weeks; week 4 also includes interest. */
-export const MIN_DEPOSIT_NGN = 100_000;
+export { MIN_DEPOSIT_NGN };
 const WEEKLY_SHARE = 0.25;
 type PayoutWeek = 1 | 2 | 3 | 4;
 
@@ -493,6 +410,7 @@ function ensureInvestmentPayoutSchedule(inv: any) {
 
 function computePayoutForInvestment(inv: any): {
   amount: number;
+  currency: string;
   phase: `week${PayoutWeek}`;
   week: PayoutWeek;
   label: string;
@@ -501,6 +419,7 @@ function computePayoutForInvestment(inv: any): {
 } {
   ensureInvestmentPayoutSchedule(inv);
   const principal = Math.max(0, Number(inv.amount) || 0);
+  const currency = normalizeCurrency(inv.currency || PAYMENT_CURRENCY);
   const week = normalizePayoutWeek(inv.payout_phase);
   const interestRate = getInterestRate();
   const principalComponent = Math.round(principal * WEEKLY_SHARE);
@@ -508,6 +427,7 @@ function computePayoutForInvestment(inv: any): {
   if (week < 4) {
     return {
       amount: principalComponent,
+      currency,
       phase: `week${week}`,
       week,
       label: `Week ${week} · 25% payout`,
@@ -519,6 +439,7 @@ function computePayoutForInvestment(inv: any): {
   const interest = Math.round(principal * interestRate);
   return {
     amount: principalComponent + interest,
+    currency,
     phase: 'week4',
     week: 4,
     label: `Week 4 · 25% + ${(interestRate * 100).toFixed(0)}% interest`,
@@ -527,337 +448,13 @@ function computePayoutForInvestment(inv: any): {
   };
 }
 
-function advanceInvestmentAfterPayout(inv: any) {
-  ensureInvestmentPayoutSchedule(inv);
-  const week = normalizePayoutWeek(inv.payout_phase);
-  if (week < 4) {
-    const nextWeek = (week + 1) as PayoutWeek;
-    inv.payout_phase = `week${nextWeek}`;
-    inv.next_payment_date = addDaysIso(inv.cycle_start_date || new Date(), nextWeek * 7);
-  } else {
-    inv.payout_phase = 'week1';
-    inv.cycle_count = (inv.cycle_count || 0) + 1;
-    const cycleStart = new Date();
-    inv.cycle_start_date = cycleStart.toISOString();
-    inv.next_payment_date = addDaysIso(cycleStart, 7);
-  }
-  store.investments.set(inv.user_id, inv);
-  return inv;
-}
-
 function addDaysIso(base: Date | string, days: number): string {
   const d = new Date(base);
   d.setDate(d.getDate() + days);
   return d.toISOString().split('T')[0];
 }
 
-function assertMinDeposit(amount: number): string | null {
-  if (!Number.isFinite(amount) || amount < MIN_DEPOSIT_NGN) {
-    return `Minimum deposit is NGN ${MIN_DEPOSIT_NGN.toLocaleString('en-NG')}. Amounts below this are not accepted.`;
-  }
-  return null;
-}
-
-// ---------------- PUBLIC & CONFIG API ----------------
-
-app.get('/api/config', (req: Request, res: Response) => {
-  res.json({
-    flutterwaveConfigured: isFlutterwaveConfigured(),
-    flutterwaveSandbox: isSandboxMode(),
-    opayAccountName: OPAY_ACCOUNT_NAME,
-    opayAccountNumber: OPAY_ACCOUNT_NUMBER,
-    opayBankName: OPAY_BANK_NAME,
-    isSupabaseLive: isLiveSupabase,
-    minDepositNgn: MIN_DEPOSIT_NGN,
-  });
-});
-
-const FALLBACK_BANKS = [
-  { id: '1', code: '044', name: 'Access Bank' },
-  { id: '2', code: '023', name: 'Citibank Nigeria' },
-  { id: '3', code: '050', name: 'Ecobank Nigeria' },
-  { id: '4', code: '070', name: 'Fidelity Bank' },
-  { id: '5', code: '011', name: 'First Bank of Nigeria' },
-  { id: '6', code: '214', name: 'First City Monument Bank' },
-  { id: '7', code: '058', name: 'Guaranty Trust Bank (GTBank)' },
-  { id: '8', code: '030', name: 'Heritage Bank' },
-  { id: '9', code: '301', name: 'Jaiz Bank' },
-  { id: '10', code: '082', name: 'Keystone Bank' },
-  { id: '11', code: '50211', name: 'Kuda Bank' },
-  { id: '12', code: '999992', name: 'OPay' },
-  { id: '13', code: '999991', name: 'PalmPay' },
-  { id: '14', code: '50515', name: 'Moniepoint MFB' },
-  { id: '15', code: '076', name: 'Polaris Bank' },
-  { id: '16', code: '101', name: 'Providus Bank' },
-  { id: '17', code: '221', name: 'Stanbic IBTC Bank' },
-  { id: '18', code: '068', name: 'Standard Chartered Bank' },
-  { id: '19', code: '232', name: 'Sterling Bank' },
-  { id: '20', code: '100', name: 'Suntrust Bank' },
-  { id: '21', code: '032', name: 'Union Bank of Nigeria' },
-  { id: '22', code: '033', name: 'United Bank for Africa (UBA)' },
-  { id: '23', code: '215', name: 'Unity Bank' },
-  { id: '24', code: '035', name: 'Wema Bank' },
-  { id: '25', code: '057', name: 'Zenith Bank' },
-];
-
-let cachedBanksList: any[] | null = null;
-
-app.get('/api/banks', async (req: Request, res: Response) => {
-  if (cachedBanksList && cachedBanksList.length > 0) {
-    return res.json({ status: 'success', message: 'Banks fetched successfully (cached)', data: cachedBanksList });
-  }
-
-  if (isFlutterwaveConfigured()) {
-    try {
-      const result: any = await Promise.race([
-        getBanks('NG'),
-        new Promise((_, reject) => setTimeout(() => reject(new Error('Banks fetch timed out')), 3000)),
-      ]);
-      const banks = (result?.data || []).map((b: any, i: number) => ({
-        id: String(b.id || i + 1),
-        code: String(b.code || b.bank_code || ''),
-        name: b.name || b.bank_name || 'Bank',
-      }));
-      if (banks.length > 0) {
-        cachedBanksList = banks;
-        return res.json({ status: 'success', message: 'Banks fetched successfully', data: banks });
-      }
-    } catch {
-      // Fallback silently without throwing unhandled network errors
-    }
-  }
-
-  cachedBanksList = FALLBACK_BANKS;
-  return res.json({ status: 'success', message: 'Banks fetched successfully', data: FALLBACK_BANKS });
-});
-
-app.post('/api/verify-account', async (req: Request, res: Response) => {
-  const { account_number, account_bank } = req.body;
-  if (!account_number || !account_bank) {
-    return res.status(400).json({ status: 'error', message: 'Account number and bank code are required' });
-  }
-
-  const cleanNuban = String(account_number).trim();
-  if (cleanNuban.length !== 10 || !/^\d+$/.test(cleanNuban)) {
-    return res.status(400).json({ status: 'error', message: 'Invalid 10-digit NUBAN account number format' });
-  }
-
-  if (!isFlutterwaveConfigured()) {
-    return res.status(503).json({ status: 'error', message: 'Bank account verification is not configured.' });
-  }
-
-  try {
-    const result = await resolveBankAccount(cleanNuban, String(account_bank));
-    const resolved = result.data || result;
-    return res.json({
-      status: 'success',
-      message: 'Account details verified',
-      data: {
-        account_number: resolved.account_number || cleanNuban,
-        account_name: resolved.account_name || resolved.account_holder_name,
-      },
-    });
-  } catch (err: any) {
-    return res.status(400).json({
-      status: 'error',
-      message: err.message || 'Unable to resolve account. Please check the account number and bank.',
-    });
-  }
-});
-
 // ---------------- AUTH FALLBACK API ----------------
-
-app.get('/api/auth/current-session', (req: Request, res: Response) => {
-  res.json({ user: store.current_session });
-});
-
-app.post('/api/auth/login', async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ message: 'Email and password required' });
-  }
-
-  const cleanEmail = email.toLowerCase().trim();
-  const storedHash = store.auth_credentials.get(cleanEmail);
-  if (!storedHash || !verifyPassword(password, storedHash)) {
-    return res.status(401).json({ message: 'Invalid email or password.' });
-  }
-
-  let profile = findCanonicalProfile(null, cleanEmail);
-  
-  if (!profile) {
-    return res.status(401).json({ message: 'Invalid email or password. Please sign up first.' });
-  }
-
-  ensureReferralCode(profile);
-
-  const { isAdmin } = await verifyIsAdmin(profile.id, profile.email);
-  const role = isAdmin ? 'admin' : (store.user_roles.get(profile.id) || 'investor');
-  const user = {
-    id: profile.id,
-    email: profile.email,
-    name: profile.name,
-  };
-  store.current_session = user;
-
-  logActivity(profile.name || profile.email, 'LOGIN', `User signed in as ${role}`);
-
-  res.json({ user, role });
-});
-
-app.post('/api/auth/signup', (req: Request, res: Response) => {
-  const { email, password, fullName, phone, agreedToTerms, referralCode, supabaseUserId } = req.body;
-  if (!agreedToTerms) {
-    return res.status(400).json({ message: 'Terms and Conditions agreement is mandatory' });
-  }
-  if (!email || !password || !fullName) {
-    return res.status(400).json({ message: 'All registration fields are required' });
-  }
-
-  const cleanEmail = email.toLowerCase().trim();
-  const existing = findCanonicalProfile(null, cleanEmail);
-  if (existing && !supabaseUserId) {
-    return res.status(400).json({ message: 'An account with this email address already exists. Please sign in.' });
-  }
-
-  const newId = supabaseUserId || existing?.id || `usr-${Date.now()}`;
-  const profile = linkCanonicalProfile(newId, {
-    id: newId,
-    name: fullName,
-    email: cleanEmail,
-    phone: phone || null,
-    total_invested: existing?.total_invested || 0,
-    current_phase: 'None',
-    payment_plan_id: null,
-    referral_earnings: existing?.referral_earnings || 0,
-    created_at: existing?.created_at || new Date().toISOString(),
-  });
-
-  ensureReferralCode(profile);
-  attachReferral(profile, referralCode);
-  store.auth_credentials.set(cleanEmail, hashPassword(password));
-  store.user_roles.set(profile.id, 'investor');
-
-  const user = { id: profile.id, email: cleanEmail, name: fullName };
-  store.current_session = user;
-
-  logActivity(fullName, 'SIGNUP', 'New investor account registered with ₦0 initial balance');
-
-  res.json({ user, role: 'investor' });
-});
-
-app.post('/api/auth/logout', (req: Request, res: Response) => {
-  store.current_session = null;
-  res.json({ success: true });
-});
-
-// Dedicated Admin Email Authentication Endpoint
-app.post('/api/auth/admin-login', async (req: Request, res: Response) => {
-  const { email, password } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, message: 'Administrator email and password required' });
-  }
-
-  const cleanEmail = email.toLowerCase().trim();
-  const isAllowlisted = store.admin_allowlist.has(cleanEmail);
-  
-  if (!isAllowlisted) {
-    return res.status(403).json({ 
-      success: false, 
-      message: `The account ${cleanEmail} is not on the administrator allowlist. Please verify the approved admin email address.` 
-    });
-  }
-
-  const storedHash = store.auth_credentials.get(cleanEmail);
-  if (storedHash && !verifyPassword(password, storedHash)) {
-    return res.status(401).json({ success: false, message: 'Invalid admin credentials.' });
-  }
-  if (!storedHash) {
-    // First local login after allowlist seed — require register first
-    return res.status(401).json({
-      success: false,
-      message: 'Admin account not initialized. Use Register on the admin gate first.',
-    });
-  }
-
-  let profile = findCanonicalProfile(null, cleanEmail);
-  if (!profile) {
-    profile = linkCanonicalProfile(`usr-admin-${Date.now()}`, {
-      id: `usr-admin-${Date.now()}`,
-      name: cleanEmail.split('@')[0] || 'System Administrator',
-      email: cleanEmail,
-      phone: null,
-      total_invested: 0,
-      current_phase: 'None',
-      payment_plan_id: null,
-      created_at: new Date().toISOString(),
-    });
-  }
-
-  store.user_roles.set(profile.id, 'admin');
-  const user = {
-    id: profile.id,
-    email: profile.email,
-    name: profile.name || 'System Administrator',
-  };
-  store.current_session = user;
-
-  logActivity(profile.name || cleanEmail, 'ADMIN_LOGIN', 'Administrator authenticated via Operations Gate');
-
-  res.json({ success: true, user, role: 'admin' });
-});
-
-// Dedicated Admin Email Registration / Setup Endpoint
-app.post('/api/auth/admin-register', async (req: Request, res: Response) => {
-  const { email, password, fullName } = req.body;
-  if (!email || !password) {
-    return res.status(400).json({ success: false, message: 'Administrator email and password required' });
-  }
-  if (String(password).length < 8) {
-    return res.status(400).json({ success: false, message: 'Password must be at least 8 characters.' });
-  }
-
-  const cleanEmail = email.toLowerCase().trim();
-  const isAllowlisted = store.admin_allowlist.has(cleanEmail);
-  
-  if (!isAllowlisted) {
-    return res.status(403).json({ 
-      success: false, 
-      message: `The email ${cleanEmail} is not authorized for administrative registration. Only approved administrative emails can register here.` 
-    });
-  }
-
-  let profile = findCanonicalProfile(null, cleanEmail);
-  if (!profile) {
-    const newId = `usr-admin-${Date.now()}`;
-    profile = linkCanonicalProfile(newId, {
-      id: newId,
-      name: fullName || cleanEmail.split('@')[0] || 'System Administrator',
-      email: cleanEmail,
-      phone: null,
-      total_invested: 0,
-      current_phase: 'None',
-      payment_plan_id: null,
-      created_at: new Date().toISOString(),
-    });
-  } else if (fullName) {
-    profile.name = fullName;
-    store.profiles.set(profile.id, profile);
-  }
-
-  store.auth_credentials.set(cleanEmail, hashPassword(password));
-  store.user_roles.set(profile.id, 'admin');
-  const user = {
-    id: profile.id,
-    email: profile.email,
-    name: profile.name,
-  };
-  store.current_session = user;
-
-  logActivity(profile.name || cleanEmail, 'ADMIN_REGISTRATION', 'Administrator account initialized via Operations Gate');
-
-  res.json({ success: true, user, role: 'admin' });
-});
 
 // ---------------- INVESTOR DASHBOARD API ----------------
 
@@ -959,52 +556,6 @@ app.get('/api/investor/profile/:id', async (req: Request, res: Response) => {
   return res.status(404).json({ message: 'Profile not found' });
 });
 
-app.post('/api/investor/register-profile', async (req: Request, res: Response) => {
-  const { id, email, name, phone, referralCode } = req.body;
-  const cleanEmail = (email || '').toLowerCase().trim();
-
-  // Find existing profile by email first
-  let profile = findCanonicalProfile(id, cleanEmail);
-
-  if (profile) {
-    // Update existing profile with new ID and metadata
-    profile.id = id;
-    if (name && name !== 'Investor') profile.name = name;
-    if (phone) profile.phone = phone;
-    store.profiles.set(id, profile);
-  } else {
-    profile = {
-      id,
-      name: name || (cleanEmail ? cleanEmail.split('@')[0] : 'Investor'),
-      email: cleanEmail,
-      phone: phone || '',
-      total_invested: 0,
-      current_phase: 'None',
-      payment_plan_id: null,
-      referral_earnings: 0,
-      created_at: new Date().toISOString(),
-    };
-    linkCanonicalProfile(id, profile);
-  }
-
-  ensureReferralCode(profile);
-  attachReferral(profile, referralCode);
-
-  if (isLiveSupabase && supabaseAdmin && isValidUUID(id)) {
-    try {
-      await supabaseAdmin.from('profiles').upsert(profile);
-      await supabaseAdmin.from('user_roles').upsert({ user_id: id, role: 'investor' });
-    } catch (err) {
-      console.error('Error registering profile to Supabase:', err);
-    }
-  }
-
-  if (!store.user_roles.has(id)) {
-    store.user_roles.set(id, 'investor');
-  }
-  res.json(profile);
-});
-
 app.get('/api/investor/dashboard/:id', async (req: Request, res: Response) => {
   const userId = req.params.id;
   const queryEmail = (req.query.email as string || '').toLowerCase().trim();
@@ -1030,7 +581,7 @@ app.get('/api/investor/dashboard/:id', async (req: Request, res: Response) => {
         supabaseAdmin.from('card_details').select('*').eq('user_id', userId).maybeSingle(),
         supabaseAdmin.from('investments').select('*').eq('user_id', userId).maybeSingle(),
         supabaseAdmin.from('payments').select('*').eq('user_id', userId).order('created_at', { ascending: false }),
-        supabaseAdmin.from('payouts').select('*').eq('user_id', userId).order('scheduled_date', { ascending: false }),
+        supabaseAdmin.from('payouts').select('*').eq('user_id', userId).order('processed_at', { ascending: false }),
         supabaseAdmin.from('opay_receipts').select('*').eq('user_id', userId).order('uploaded_at', { ascending: false }),
         supabaseAdmin.from('notifications').select('*').or(`audience.eq.all,target_user_id.eq.${userId}`).order('sent_at', { ascending: false }),
       ]);
@@ -1061,15 +612,15 @@ app.get('/api/investor/dashboard/:id', async (req: Request, res: Response) => {
       }
 
       // Merge Supabase and in-memory payments to ensure zero data loss
-      const localPayments = store.payments.filter((p) => 
+      const localPayments = store.payments.filter((p) =>
         p.user_id === userId || (finalProfile?.id && p.user_id === finalProfile.id) || (effectiveEmail && p.user_email?.toLowerCase() === effectiveEmail)
       );
-      const localReceipts = store.opay_receipts.filter((r) => 
+      const localReceipts = store.opay_receipts.filter((r) =>
         r.user_id === userId || (finalProfile?.id && r.user_id === finalProfile.id) || (effectiveEmail && r.user_email?.toLowerCase() === effectiveEmail)
       );
       const localInvestment = store.investments.get(userId) || (finalProfile?.id ? store.investments.get(finalProfile.id) : null);
 
-      const mergedPayments = [...(payData || []), ...localPayments.filter(lp => !(payData || []).some((p: any) => p.id === lp.id || (p.flutterwave_tx_ref && p.flutterwave_tx_ref === lp.flutterwave_tx_ref)))];
+      const mergedPayments = [...(payData || []), ...localPayments.filter(lp => !(payData || []).some((p: any) => p.id === lp.id || (p.provider_reference && p.provider_reference === lp.provider_reference)))];
       const mergedReceipts = [...(receiptData || []), ...localReceipts.filter(lr => !(receiptData || []).some((r: any) => r.id === lr.id))];
 
       const approvedReceiptsTotal = mergedReceipts
@@ -1117,7 +668,7 @@ app.get('/api/investor/dashboard/:id', async (req: Request, res: Response) => {
       return res.json({
         profile: finalProfile || null,
         bankDetails: bankData || store.bank_details.get(userId) || (finalProfile?.id ? store.bank_details.get(finalProfile.id) : null) || null,
-        cardDetails: cardData || store.card_details.get(userId) || (finalProfile?.id ? store.card_details.get(finalProfile.id) : null) || null,
+        cardDetails: store.card_details.get(userId) || (finalProfile?.id ? store.card_details.get(finalProfile.id) : null) || cardData || null,
         investment: finalInvestment,
         payments: mergedPayments,
         payouts: payoutData || store.payouts.filter((p) => p.user_id === userId || (finalProfile?.id && p.user_id === finalProfile.id)),
@@ -1159,15 +710,15 @@ app.get('/api/investor/dashboard/:id', async (req: Request, res: Response) => {
 
   const bankDetails = store.bank_details.get(userId) || store.bank_details.get(profileId) || null;
   const cardDetails = store.card_details.get(userId) || store.card_details.get(profileId) || null;
-  
+
   // Find payments, receipts, payouts matching user_id or email
-  const payments = store.payments.filter((p) => 
+  const payments = store.payments.filter((p) =>
     p.user_id === userId || p.user_id === profileId || (userEmail && p.user_email?.toLowerCase() === userEmail)
   );
-  const payouts = store.payouts.filter((p) => 
+  const payouts = store.payouts.filter((p) =>
     p.user_id === userId || p.user_id === profileId || (userEmail && p.user_email?.toLowerCase() === userEmail)
   );
-  const opayReceipts = store.opay_receipts.filter((r) => 
+  const opayReceipts = store.opay_receipts.filter((r) =>
     r.user_id === userId || r.user_id === profileId || (userEmail && r.user_email?.toLowerCase() === userEmail)
   );
   const notifications = store.notifications.filter(
@@ -1237,958 +788,14 @@ app.get('/api/investor/dashboard/:id', async (req: Request, res: Response) => {
   });
 });
 
-app.post('/api/investor/auto-debit-plan', (req: Request, res: Response) => {
-  const { userId, amount } = req.body;
-  if (!userId || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ message: 'userId and a positive monthly amount are required' });
-  }
-  const minErr = assertMinDeposit(Number(amount));
-  if (minErr) return res.status(400).json({ message: minErr });
-  const card = store.card_details.get(userId);
-  if (!card?.flutterwave_card_token) {
-    return res.status(400).json({
-      message: 'Save a debit card first via a Flutterwave payment, then set your monthly auto-debit amount.',
-    });
-  }
-  const now = new Date();
-  const nextCharge = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString().split('T')[0];
-  const reminder = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate() - 1).toISOString().split('T')[0];
-  const plan = {
-    user_id: userId,
-    amount: Number(amount),
-    active: true,
-    next_charge_date: nextCharge,
-    reminder_date: reminder,
-    last_reminder_sent: null,
-    created_at: new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  };
-  store.auto_debit_plans.set(userId, plan);
-
-  const profile = store.profiles.get(userId);
-  if (profile) {
-    profile.payment_plan_id = `plan_auto_${Date.now()}`;
-    store.profiles.set(userId, profile);
-  }
-
-  store.notifications.unshift({
-    id: `notif-ad-${Date.now()}`,
-    title: 'Monthly auto-debit activated',
-    body: `Your card will be charged ₦${Number(amount).toLocaleString()} each month. We’ll remind you a day before.`,
-    audience: 'single',
-    target_user_id: userId,
-    icon: 'bell',
-    image_url: null,
-    sent_at: new Date().toISOString(),
-    delivery_status: 'delivered',
-  });
-
-  logActivity(profile?.name || userId, 'AUTO_DEBIT_SET', `Monthly auto-debit set to ₦${Number(amount).toLocaleString()}`);
-  res.json(plan);
-});
-
-/** Charge due monthly auto-debit subscriptions via Flutterwave tokenized card */
-app.post('/api/investor/process-auto-debits', async (_req: Request, res: Response) => {
-  if (!isFlutterwaveConfigured()) {
-    return res.status(503).json({ message: 'Flutterwave is not configured.' });
-  }
-
-  const today = new Date().toISOString().split('T')[0];
-  const frontendUrl = (process.env.FRONTEND_URL || process.env.APP_URL || 'https://sigmawealthsolution.vercel.app').replace(/\/$/, '');
-  const results: Array<{ userId: string; status: string; message?: string; reference?: string }> = [];
-
-  for (const plan of store.auto_debit_plans.values()) {
-    if (!plan.active || !plan.next_charge_date || plan.next_charge_date > today) continue;
-
-    const userId = plan.user_id;
-    const profile = store.profiles.get(userId);
-    const card = store.card_details.get(userId);
-    const amount = Number(plan.amount) || 0;
-    if (!amount || !profile?.email) {
-      results.push({ userId, status: 'skipped', message: 'Missing profile or amount' });
-      continue;
-    }
-
-    const reference = `SIGMAAD${Date.now()}${crypto.randomUUID().replace(/[^a-zA-Z0-9]/g, '').slice(0, 6)}`;
-    const redirectUrl = `${frontendUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
-
-    try {
-      let charge: any = null;
-      let chargeId: string | null = null;
-
-      if (card?.flutterwave_card_token && card?.flutterwave_customer_id) {
-        const charged = await chargeSavedPaymentMethod({
-          amount,
-          reference,
-          customerId: card.flutterwave_customer_id,
-          paymentMethodId: card.flutterwave_card_token,
-          redirectUrl,
-        });
-        charge = charged.data || charged;
-        chargeId = charge?.id || null;
-      } else {
-        // Fallback: first monthly charge / sandbox without customer id — use orchestration charge
-        const initiated = await initiateDirectCharge({
-          amount,
-          reference,
-          email: profile.email,
-          name: profile.name,
-          phone: profile.phone || '00000000000',
-          redirectUrl,
-          paymentType: 'card',
-          meta: { userId, phase: profile.current_phase || 'Active Plan', isRecurringPlan: true },
-        });
-        charge = initiated.data || initiated;
-        chargeId = charge?.id || null;
-        if (isSandboxMode() && charge?.status === 'pending' && chargeId) {
-          const completed = await completeSandboxCharge(chargeId);
-          charge = completed.charge;
-        }
-      }
-
-      if (!chargeId) {
-        results.push({ userId, status: 'failed', message: 'No charge id returned' });
-        continue;
-      }
-
-      pendingCharges.set(reference, {
-        chargeId,
-        userId,
-        amount,
-        phase: profile.current_phase || 'Active Plan',
-        isRecurringPlan: true,
-        email: profile.email,
-        name: profile.name || 'Investor',
-      });
-
-      if (isChargeSucceeded(charge?.status)) {
-        await creditVerifiedPayment({
-          userId,
-          email: profile.email,
-          name: profile.name,
-          verifiedAmount: amount,
-          phase: profile.current_phase || 'Active Plan',
-          isRecurringPlan: true,
-          txRef: reference,
-          flwRef: String(chargeId),
-          cardToken: charge?.payment_method?.id || card?.flutterwave_card_token || null,
-          customerId: charge?.customer?.id || card?.flutterwave_customer_id || null,
-          cardLast4: charge?.payment_method?.card?.last4 || card?.card_last4 || '****',
-          cardBrand: charge?.payment_method?.card?.network || card?.card_brand || 'Card',
-        });
-
-        const next = new Date();
-        next.setMonth(next.getMonth() + 1);
-        plan.next_charge_date = next.toISOString().split('T')[0];
-        const rem = new Date(next);
-        rem.setDate(rem.getDate() - 1);
-        plan.reminder_date = rem.toISOString().split('T')[0];
-        plan.updated_at = new Date().toISOString();
-        store.auto_debit_plans.set(userId, plan);
-        results.push({ userId, status: 'charged', reference });
-      } else {
-        results.push({ userId, status: 'pending', reference, message: charge?.status || 'awaiting authorization' });
-      }
-    } catch (err: any) {
-      results.push({ userId, status: 'failed', message: err.message || 'Charge failed' });
-    }
-  }
-
-  res.json({ success: true, processed: results.length, results });
-});
-
-/** Send day-before auto-debit reminders (callable by admin cron / refresh) */
-app.post('/api/investor/auto-debit-reminders', (_req: Request, res: Response) => {
-  const today = new Date().toISOString().split('T')[0];
-  let sent = 0;
-  for (const plan of store.auto_debit_plans.values()) {
-    if (!plan.active) continue;
-    if (plan.reminder_date === today && plan.last_reminder_sent !== today) {
-      store.notifications.unshift({
-        id: `notif-adr-${Date.now()}-${sent}`,
-        title: 'Auto-debit tomorrow',
-        body: `Reminder: ₦${Number(plan.amount).toLocaleString()} will be charged to your saved card tomorrow.`,
-        audience: 'single',
-        target_user_id: plan.user_id,
-        icon: 'calendar',
-        image_url: null,
-        sent_at: new Date().toISOString(),
-        delivery_status: 'delivered',
-      });
-      plan.last_reminder_sent = today;
-      sent += 1;
-    }
-  }
-  res.json({ success: true, sent });
-});
-
-app.post('/api/investor/bank-details', (req: Request, res: Response) => {
-  const {
-    userId,
-    accountNumber,
-    bankCode,
-    bankName,
-    accountName,
-    country,
-    currency,
-    stripeAccountId,
-  } = req.body || {};
-  if (!userId || !accountName) {
-    return res.status(400).json({ message: 'userId and account holder name are required' });
-  }
-
-  const existing = store.bank_details.get(userId) || {};
-  const record = {
-    ...existing,
-    user_id: userId,
-    account_number: accountNumber || existing.account_number || null,
-    bank_code: bankCode || existing.bank_code || null,
-    bank_name: bankName || existing.bank_name || null,
-    account_name: accountName,
-    country: String(country || existing.country || 'NG').toUpperCase(),
-    currency: String(currency || existing.currency || 'NGN').toUpperCase(),
-    stripe_account_id: stripeAccountId || existing.stripe_account_id || null,
-    flutterwave_beneficiary_id: existing.flutterwave_beneficiary_id || `bene_${Date.now()}`,
-    created_at: existing.created_at || new Date().toISOString(),
-    updated_at: new Date().toISOString(),
-  };
-
-  store.bank_details.set(userId, record);
-  logActivity(accountName, 'BANK_DETAILS_SAVED', `Updated payout destination (${record.country})`);
-
-  res.json(record);
-});
-
-/** Stripe Connect — investor links local bank worldwide for automatic payouts */
-app.post('/api/investor/connect/onboard', async (req: Request, res: Response) => {
-  const { userId, email, country = 'NG', accountName } = req.body || {};
-  if (!userId || !email) {
-    return res.status(400).json({ message: 'userId and email are required' });
-  }
-  if (!isStripeConfigured()) {
-    return res.status(503).json({
-      message: 'Stripe is not configured. Set STRIPE_SECRET_KEY on Render.',
-    });
-  }
-
-  try {
-    const destCountry = String(country || 'NG').toUpperCase();
-    let bank = store.bank_details.get(userId) || {};
-    let accountId = bank.stripe_account_id;
-
-    if (!accountId) {
-      accountId = await createConnectExpressAccount({
-        email: String(email).trim(),
-        country: destCountry,
-        userId: String(userId),
-      });
-    }
-
-    const frontend = getFrontendBaseUrl();
-    const url = await createConnectOnboardingLink({
-      accountId,
-      refreshUrl: `${frontend}/dashboard?connect_refresh=1`,
-      returnUrl: `${frontend}/dashboard?connect_return=1`,
-    });
-
-    const record = {
-      ...bank,
-      user_id: userId,
-      country: destCountry,
-      currency: currencyForCountry(destCountry).toUpperCase(),
-      account_name: accountName || bank.account_name || 'Investor',
-      stripe_account_id: accountId,
-      connect_onboarding_complete: Boolean(bank.connect_onboarding_complete),
-      updated_at: new Date().toISOString(),
-      created_at: bank.created_at || new Date().toISOString(),
-    };
-    store.bank_details.set(userId, record);
-
-    if (isLiveSupabase && supabaseAdmin && /^[0-9a-f-]{36}$/i.test(String(userId))) {
-      try {
-        await supabaseAdmin.from('bank_details').upsert(record);
-      } catch (err) {
-        console.warn('Connect bank upsert notice:', err);
-      }
-    }
-
-    return res.json({
-      success: true,
-      stripeAccountId: accountId,
-      onboardingUrl: url,
-      message: 'Complete Stripe Connect to link your local bank for automatic payouts.',
-    });
-  } catch (err: any) {
-    console.error('Connect onboard error:', err);
-    return res.status(500).json({ message: err.message || 'Failed to start Stripe Connect onboarding' });
-  }
-});
-
-app.post('/api/investor/cancel-subscription', (req: Request, res: Response) => {
-  const { userId } = req.body;
-  const investment = store.investments.get(userId);
-  const profile = store.profiles.get(userId);
-
-  if (investment) {
-    investment.type = 'one-time';
-    investment.status = 'paused';
-    store.investments.set(userId, investment);
-  }
-
-  if (profile) {
-    profile.payment_plan_id = null;
-    store.profiles.set(userId, profile);
-  }
-
-  logActivity(profile?.name || userId, 'CANCEL_AUTO_DEBIT', 'Cancelled monthly auto-debit subscription plan');
-
-  res.json({ success: true, message: 'Auto-debit subscription successfully cancelled' });
-});
-
-// ---------------- FLUTTERWAVE PAYMENTS & WEBHOOK API (v4) ----------------
-
-function isChargeSucceeded(status?: string): boolean {
-  return status === 'succeeded' || status === 'successful';
-}
-
-async function creditVerifiedPayment(params: {
-  userId?: string;
-  email?: string;
-  name?: string;
-  verifiedAmount: number;
-  phase?: string;
-  isRecurringPlan?: boolean;
-  txRef: string;
-  flwRef: string;
-  cardLast4?: string;
-  cardBrand?: string;
-  cardToken?: string | null;
-  customerId?: string | null;
-}) {
-  const {
-    userId,
-    email,
-    name,
-    verifiedAmount,
-    phase,
-    isRecurringPlan,
-    txRef,
-    flwRef,
-    cardLast4 = '****',
-    cardBrand = 'Card',
-    cardToken = null,
-    customerId = null,
-  } = params;
-
-  const verifiedCustomerEmail = (email || '').toLowerCase().trim();
-  const verifiedCustomerName = name || 'Investor';
-
-  let profile: any = userId ? store.profiles.get(userId) : null;
-  if (!profile && verifiedCustomerEmail) {
-    for (const [_, p] of store.profiles.entries()) {
-      if (p.email && p.email.toLowerCase() === verifiedCustomerEmail) {
-        profile = p;
-        break;
-      }
-    }
-  }
-
-  if (!profile) {
-    profile = linkCanonicalProfile(userId || `usr-${Date.now()}`, {
-      id: userId || `usr-${Date.now()}`,
-      name: verifiedCustomerName,
-      email: verifiedCustomerEmail,
-      phone: '',
-      total_invested: 0,
-      current_phase: phase || 'None',
-      payment_plan_id: null,
-      created_at: new Date().toISOString(),
-    });
-  }
-
-  const effectiveUserId = profile.id;
-  const targetPhase = phase || profile.current_phase || 'None';
-
-  const existingPayment = store.payments.find(
-    (p) => (txRef && p.flutterwave_tx_ref === txRef) || (flwRef && (p.flutterwave_ref === flwRef || p.reference === flwRef))
-  );
-
-  let payment: any = existingPayment;
-
-  if (!existingPayment) {
-    payment = {
-      id: `pay-${Date.now()}`,
-      user_id: effectiveUserId,
-      user_email: profile.email || verifiedCustomerEmail,
-      amount: verifiedAmount,
-      method: isRecurringPlan ? 'auto_debit' : 'card',
-      flutterwave_tx_ref: txRef,
-      flutterwave_ref: flwRef,
-      reference: txRef || flwRef,
-      status: 'successful',
-      notes: `Flutterwave payment (${targetPhase})`,
-      created_at: new Date().toISOString(),
-    };
-    store.payments.unshift(payment);
-
-    profile.total_invested = Number(profile.total_invested || 0) + verifiedAmount;
-    profile.current_phase = targetPhase;
-    if (isRecurringPlan) {
-      profile.payment_plan_id = `plan_flw_${Date.now()}`;
-    }
-    store.profiles.set(profile.id, profile);
-    if (userId && userId !== profile.id) {
-      store.profiles.set(userId, profile);
-    }
-    creditReferralCommission(profile, verifiedAmount);
-  }
-
-  if (cardToken) {
-    const cardRecord = {
-      user_id: effectiveUserId,
-      flutterwave_card_token: cardToken,
-      flutterwave_customer_id: customerId || null,
-      card_last4: cardLast4,
-      card_brand: cardBrand,
-      card_exp_month: '12',
-      card_exp_year: '28',
-      created_at: new Date().toISOString(),
-    };
-    store.card_details.set(effectiveUserId, cardRecord);
-    if (userId && userId !== effectiveUserId) {
-      store.card_details.set(userId, cardRecord);
-    }
-  }
-
-  if (isRecurringPlan && verifiedAmount > 0) {
-    const now = new Date();
-    const nextCharge = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate()).toISOString().split('T')[0];
-    const reminder = new Date(now.getFullYear(), now.getMonth() + 1, now.getDate() - 1).toISOString().split('T')[0];
-    const plan = {
-      user_id: effectiveUserId,
-      amount: verifiedAmount,
-      active: true,
-      next_charge_date: nextCharge,
-      reminder_date: reminder,
-      last_reminder_sent: null,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    };
-    store.auto_debit_plans.set(effectiveUserId, plan);
-    if (userId && userId !== effectiveUserId) {
-      store.auto_debit_plans.set(userId, plan);
-    }
-    profile.payment_plan_id = profile.payment_plan_id || `plan_flw_${Date.now()}`;
-    store.profiles.set(effectiveUserId, profile);
-  }
-
-  let investment = store.investments.get(effectiveUserId) || (userId ? store.investments.get(userId) : null);
-  const now = new Date();
-
-  if (investment) {
-    if (!existingPayment) {
-      investment.amount = Number(investment.amount) + verifiedAmount;
-    }
-    investment.phase = targetPhase;
-    investment.type = isRecurringPlan ? 'auto' : investment.type;
-    investment.status = 'active';
-    ensureInvestmentPayoutSchedule(investment);
-    if (!investment.next_payment_date) {
-      investment.next_payment_date = addDaysIso(now, 7);
-    }
-  } else {
-    investment = {
-      id: `inv-${Date.now()}`,
-      user_id: effectiveUserId,
-      amount: profile.total_invested > 0 ? profile.total_invested : verifiedAmount,
-      phase: targetPhase,
-      type: isRecurringPlan ? 'auto' : 'one-time',
-      status: 'active',
-      start_date: now.toISOString(),
-      cycle_start_date: now.toISOString(),
-      payout_phase: 'week1',
-      next_payment_date: addDaysIso(now, 7),
-      cycle_count: 1,
-      created_at: now.toISOString(),
-    };
-  }
-  store.investments.set(effectiveUserId, investment);
-  if (userId && userId !== effectiveUserId) {
-    store.investments.set(userId, investment);
-  }
-
-  if (isLiveSupabase && supabaseAdmin && isValidUUID(effectiveUserId)) {
-    try {
-      await supabaseAdmin.from('profiles').upsert({
-        id: effectiveUserId,
-        name: profile.name,
-        email: profile.email,
-        phone: profile.phone,
-        total_invested: profile.total_invested,
-        current_phase: profile.current_phase,
-      });
-
-      const invPayload: any = {
-        user_id: effectiveUserId,
-        amount: investment.amount,
-        phase: investment.phase,
-        type: investment.type,
-        status: 'active',
-        start_date: investment.start_date,
-        next_payment_date: investment.next_payment_date,
-        cycle_count: investment.cycle_count || 1,
-      };
-      if (isValidUUID(investment.id)) {
-        invPayload.id = investment.id;
-      }
-      await supabaseAdmin.from('investments').upsert(invPayload, { onConflict: 'user_id' });
-
-      if (!existingPayment) {
-        const payPayload: any = {
-          user_id: effectiveUserId,
-          amount: verifiedAmount,
-          method: payment.method || 'card',
-          flutterwave_tx_ref: payment.flutterwave_tx_ref,
-          status: 'successful',
-          notes: payment.notes,
-          created_at: payment.created_at,
-        };
-        if (isValidUUID(payment.id)) {
-          payPayload.id = payment.id;
-        }
-        await supabaseAdmin.from('payments').insert(payPayload);
-
-        // Also add a database notification
-        await supabaseAdmin.from('notifications').insert({
-          id: crypto.randomUUID(),
-          title: 'Payment Received',
-          body: `Congratulations! Your payment of ₦${verifiedAmount.toLocaleString()} has been successfully credited to ${targetPhase}.`,
-          audience: effectiveUserId,
-          target_user_id: effectiveUserId,
-          delivery_status: 'delivered'
-        });
-      }
-    } catch (dbErr) {
-      console.warn('Supabase sync warning on payment credit:', dbErr);
-    }
-  }
-
-  if (!existingPayment) {
-    logActivity(
-      profile?.name || verifiedCustomerEmail || effectiveUserId,
-      'PAYMENT_RECEIVED',
-      `Received payment of ₦${verifiedAmount.toLocaleString()} via Flutterwave`,
-      verifiedAmount
-    );
-
-    // Push local notification for RAM state
-    store.notifications.unshift({
-      id: crypto.randomUUID(),
-      title: 'Payment Received',
-      body: `Congratulations! Your payment of ₦${verifiedAmount.toLocaleString()} has been successfully credited to ${targetPhase}.`,
-      audience: effectiveUserId,
-      target_user_id: effectiveUserId,
-      sent_at: new Date().toISOString(),
-      delivery_status: 'delivered',
-    });
-  }
-
-  pendingCharges.delete(txRef);
-  return { payment, investment, profile, existingPayment: Boolean(existingPayment) };
-}
-
-app.post('/api/flutterwave/initiate', async (req: Request, res: Response) => {
-  const { userId, email, name, phone, amount, phase, isRecurringPlan, paymentType } = req.body;
-
-  if (!email || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ message: 'Valid email and amount are required.' });
-  }
-  const minErr = assertMinDeposit(Number(amount));
-  if (minErr) return res.status(400).json({ message: minErr });
-  if (!isFlutterwaveConfigured()) {
-    return res.status(503).json({ message: 'Flutterwave is not configured.' });
-  }
-  if (!FLUTTERWAVE_ENCRYPTION_KEY) {
-    return res.status(503).json({ message: 'FLUTTERWAVE_ENCRYPTION_KEY is required for card payments.' });
-  }
-
-  const reference = `SIGMA${Date.now()}${crypto.randomUUID().replace(/[^a-zA-Z0-9]/g, '').slice(0, 8)}`;
-  const frontendUrl = (process.env.FRONTEND_URL || process.env.APP_URL || 'https://sigmawealthsolution.vercel.app').replace(/\/$/, '');
-  const redirectUrl = `${frontendUrl}/api/flutterwave/callback?reference=${encodeURIComponent(reference)}`;
-
-  try {
-    const result = await initiateDirectCharge({
-      amount: Number(amount),
-      reference,
-      email: String(email).trim(),
-      name,
-      phone,
-      redirectUrl,
-      paymentType: paymentType === 'opay' ? 'opay' : 'card',
-      meta: { userId, phase, isRecurringPlan: !!isRecurringPlan },
-    });
-
-    let charge = result.data || result;
-    const chargeId = charge.id;
-    if (!chargeId) {
-      return res.status(502).json({ message: 'Flutterwave did not return a charge ID.' });
-    }
-
-    pendingCharges.set(reference, {
-      chargeId,
-      userId: userId || '',
-      amount: Number(amount),
-      phase: phase || 'None',
-      isRecurringPlan: !!isRecurringPlan,
-      email: String(email).trim(),
-      name: name || 'Investor',
-    });
-
-    let redirectTo: string | null = null;
-    if (isSandboxMode() && charge.status === 'pending') {
-      const completed = await completeSandboxCharge(chargeId);
-      charge = completed.charge;
-      redirectTo = completed.redirectUrl;
-    } else if (charge.next_action?.type === 'redirect_url') {
-      redirectTo = charge.next_action.redirect_url?.url || charge.next_action.redirect_url || null;
-    }
-
-    if (isChargeSucceeded(charge.status)) {
-      return res.json({
-        success: true,
-        chargeId,
-        reference,
-        status: charge.status,
-        redirectUrl: null,
-        completed: true,
-      });
-    }
-
-    return res.json({
-      success: true,
-      chargeId,
-      reference,
-      status: charge.status,
-      redirectUrl: redirectTo,
-      completed: false,
-      nextAction: charge.next_action || null,
-    });
-  } catch (err: any) {
-    console.error('Flutterwave initiate error:', err);
-    return res.status(500).json({ message: err.message || 'Failed to initiate payment.', payload: err.payload });
-  }
-});
-
-app.get('/api/flutterwave/callback', (req: Request, res: Response) => {
-  const reference = req.query.reference || req.query.tx_ref || '';
-  res.redirect(`/dashboard?flw_return=1&reference=${encodeURIComponent(String(reference))}`);
-});
-
-app.post('/api/flutterwave/webhook', async (req: Request, res: Response) => {
-  try {
-    const payload = req.body;
-    if (!payload || !payload.data) {
-      return res.status(200).json({ status: 'ignored', message: 'No payload data' });
-    }
-
-    const eventType = payload.type || payload.event;
-    const data = payload.data;
-    if (!data) {
-      return res.status(200).json({ status: 'ignored', message: 'No payload data' });
-    }
-
-    if (eventType === 'transfer.completed') {
-      const transferId = data.id;
-      const status = isChargeSucceeded(data.status) ? 'successful' : 'failed';
-      const payout = store.payouts.find((p) => p.flutterwave_transfer_id === String(transferId));
-      if (payout) {
-        payout.status = status;
-        payout.processed_at = new Date().toISOString();
-        logActivity(
-          'Flutterwave Webhook',
-          'PAYOUT_WEBHOOK_STATUS',
-          `Transfer #${transferId} completed with status: ${status}`
-        );
-      }
-    } else if (eventType === 'charge.completed' && isChargeSucceeded(data.status)) {
-      const txRef = data.reference || data.tx_ref;
-      const flwRef = data.id || data.flw_ref;
-      const amount = Number(data.amount) || 0;
-      const customerEmail = (data.customer?.email || '').toLowerCase().trim();
-      const customerName = data.customer?.name?.first
-        ? `${data.customer.name.first} ${data.customer.name.last || ''}`.trim()
-        : data.customer?.name || 'Investor';
-      const pending = txRef ? pendingCharges.get(txRef) : undefined;
-      const card = data.payment_method?.card;
-      const cardLast4 = card?.last4 || '****';
-      const cardBrand = card?.network || card?.brand || 'Card';
-
-      await creditVerifiedPayment({
-        userId: pending?.userId,
-        email: customerEmail || pending?.email,
-        name: customerName || pending?.name,
-        verifiedAmount: amount,
-        phase: pending?.phase,
-        isRecurringPlan: pending?.isRecurringPlan,
-        txRef: txRef || `FLW_${flwRef}`,
-        flwRef: String(flwRef),
-        cardLast4,
-        cardBrand,
-        cardToken: data.payment_method?.id || null,
-        customerId: data.customer?.id || null,
-      });
-    }
-
-    return res.status(200).json({ status: 'success' });
-  } catch (err: any) {
-    console.error('Flutterwave webhook processing error:', err);
-    return res.status(200).json({ status: 'error', message: err.message });
-  }
-});
-
-app.post('/api/flutterwave/sync', async (req: Request, res: Response) => {
-  res.json({
-    success: true,
-    syncedCount: 0,
-    totalPayments: store.payments.length,
-    message: 'Payments are synchronized via webhooks and charge verification in Flutterwave v4.',
-  });
-});
-
-app.post('/api/flutterwave/verify', async (req: Request, res: Response) => {
-  const { chargeId, transactionId, txRef, flwRef, userId, email, name, amount, phase, isRecurringPlan } = req.body;
-
-  if (!userId && !email) {
-    return res.status(400).json({ message: 'Missing user identification parameters' });
-  }
-
-  const pending = txRef ? pendingCharges.get(txRef) : undefined;
-  const resolvedChargeId = chargeId || transactionId || pending?.chargeId;
-  let verifiedAmount = Number(amount) || pending?.amount || 0;
-  let resolvedTxRef = txRef || '';
-  let resolvedFlwRef = flwRef || '';
-  let cardLast4 = '****';
-  let cardBrand = 'Card';
-  let cardToken: string | null = null;
-  let customerId: string | null = null;
-
-  if (!isFlutterwaveConfigured()) {
-    return res.status(503).json({ message: 'Flutterwave is not configured.' });
-  }
-
-  if (!resolvedChargeId) {
-    return res.status(400).json({ message: 'Charge ID is required to verify payment.' });
-  }
-
-  try {
-    const chargeRes = await getCharge(String(resolvedChargeId));
-    const charge = chargeRes.data;
-    if (!isChargeSucceeded(charge?.status)) {
-      return res.status(400).json({ message: `Payment not completed. Current status: ${charge?.status || 'unknown'}` });
-    }
-
-    verifiedAmount = Number(charge.amount) || verifiedAmount;
-    resolvedTxRef = charge.reference || resolvedTxRef || `APEX_${resolvedChargeId}`;
-    resolvedFlwRef = charge.id || resolvedFlwRef;
-    const pmCard = charge.payment_method?.card;
-    if (pmCard) {
-      cardLast4 = pmCard.last4 || cardLast4;
-      cardBrand = pmCard.network || pmCard.brand || cardBrand;
-    }
-    cardToken = charge.payment_method?.id || null;
-    customerId = charge.customer?.id || null;
-  } catch (err: any) {
-    return res.status(502).json({ message: err.message || 'Failed to verify charge with Flutterwave.' });
-  }
-
-  const result = await creditVerifiedPayment({
-    userId: userId || pending?.userId,
-    email: email || pending?.email,
-    name: name || pending?.name,
-    verifiedAmount,
-    phase: phase || pending?.phase,
-    isRecurringPlan: isRecurringPlan ?? pending?.isRecurringPlan,
-    txRef: resolvedTxRef,
-    flwRef: String(resolvedFlwRef),
-    cardLast4,
-    cardBrand,
-    cardToken,
-    customerId,
-  });
-
-  res.json({
-    success: true,
-    message: result.existingPayment ? 'Payment already recorded' : 'Payment verified and investment credited successfully',
-    payment: result.payment,
-    investment: result.investment,
-    profile: result.profile,
-  });
-});
-
-// ---------------- OPAY RECEIPTS API ----------------
-
-app.post('/api/opay/submit-receipt', async (req: Request, res: Response) => {
-  const { userId, receiptImageUrl, amount, phase, userEmail } = req.body;
-  if (!userId || !receiptImageUrl || !amount) {
-    return res.status(400).json({ message: 'Receipt image and claimed amount are required' });
-  }
-
-  let prof = store.profiles.get(userId);
-  if (!prof && userEmail) {
-    for (const [_, p] of store.profiles.entries()) {
-      if (p.email && p.email.toLowerCase() === userEmail.toLowerCase()) {
-        prof = p;
-        break;
-      }
-    }
-  }
-
-  const targetPhase = phase || 'Phase 1: Seed Accumulation';
-  const emailToUse = userEmail || prof?.email || store.current_session?.email || '';
-
-  const receipt = {
-    id: `opay-${Date.now()}`,
-    user_id: userId,
-    user_email: emailToUse,
-    receipt_image_url: receiptImageUrl,
-    amount: Number(amount),
-    target_phase: targetPhase,
-    status: 'pending',
-    reviewed_by: null,
-    admin_notes: null,
-    created_at: new Date().toISOString(),
-    reviewed_at: null,
-  };
-
-  store.opay_receipts.unshift(receipt);
-
-  if (isLiveSupabase && supabaseAdmin && isValidUUID(userId)) {
-    try {
-      await supabaseAdmin.from('opay_receipts').upsert({
-        id: receipt.id,
-        user_id: userId,
-        receipt_image_url: receiptImageUrl,
-        amount: Number(amount),
-        target_phase: targetPhase,
-        status: 'pending',
-        uploaded_at: receipt.created_at,
-      });
-    } catch (err) {
-      console.warn('Supabase opay receipt upload notice:', err);
-    }
-  }
-
-  logActivity(
-    prof?.name || emailToUse || userId,
-    'OPAY_RECEIPT_UPLOAD',
-    `Uploaded OPay transfer proof for ₦${Number(amount).toLocaleString()} (${targetPhase})`,
-    Number(amount)
-  );
-
-  res.json(receipt);
-});
-
-// Helper: Server-side check for both admin role AND admin allowlist
-async function verifyIsAdmin(userId: string, userEmail?: string): Promise<{ isAdmin: boolean; reason?: string }> {
-  // If Live Supabase client is connected, query Postgres tables
-  if (isLiveSupabase && supabaseAdmin) {
-    try {
-      // 1. Resolve email
-      let emailToCheck = (userEmail || '').toLowerCase().trim();
-      if (!emailToCheck && isValidUUID(userId)) {
-        const { data: profileData } = await supabaseAdmin
-          .from('profiles')
-          .select('email')
-          .eq('id', userId)
-          .maybeSingle();
-        emailToCheck = profileData?.email?.toLowerCase()?.trim() || '';
-      }
-
-      if (!emailToCheck && isValidUUID(userId)) {
-        // Try getting from Supabase auth admin
-        try {
-          const { data: authUserData } = await supabaseAdmin.auth.admin.getUserById(userId);
-          emailToCheck = authUserData?.user?.email?.toLowerCase()?.trim() || '';
-        } catch (_) {}
-      }
-
-      if (!emailToCheck) {
-        const localProf = store.profiles.get(userId);
-        emailToCheck = (localProf?.email || (store.current_session?.id === userId ? store.current_session?.email : '') || '').toLowerCase().trim();
-      }
-
-      if (!emailToCheck) {
-        return { isAdmin: false, reason: 'EMAIL_UNRESOLVED' };
-      }
-
-      // 2. Check admin_allowlist table (Hard backstop check)
-      const { data: allowData, error: allowError } = await supabaseAdmin
-        .from('admin_allowlist')
-        .select('email')
-        .ilike('email', emailToCheck)
-        .maybeSingle();
-
-      // Check fallback allowlist in case table is freshly created
-      const isLocallyAllowlisted = store.admin_allowlist.has(emailToCheck);
-
-      if ((allowError || !allowData) && !isLocallyAllowlisted) {
-        return { isAdmin: false, reason: 'NOT_ON_ALLOWLIST' };
-      }
-
-      // 3. User is verified in allowlist! Ensure user_roles has admin role if userId is UUID
-      if (isValidUUID(userId)) {
-        const { data: roleData } = await supabaseAdmin
-          .from('user_roles')
-          .select('role')
-          .eq('user_id', userId)
-          .maybeSingle();
-
-        if (!roleData || roleData.role !== 'admin') {
-          try {
-            await supabaseAdmin.from('user_roles').upsert({ user_id: userId, role: 'admin' });
-          } catch (_) {}
-        }
-      }
-
-      store.user_roles.set(userId, 'admin');
-      return { isAdmin: true };
-    } catch (err) {
-      console.error('Error during Supabase admin verification:', err);
-      // Fallback check against local store allowlist
-      const fallbackEmail = (userEmail || '').toLowerCase().trim();
-      if (fallbackEmail && store.admin_allowlist.has(fallbackEmail)) {
-        store.user_roles.set(userId, 'admin');
-        return { isAdmin: true };
-      }
-      return { isAdmin: false, reason: 'VERIFICATION_ERROR' };
-    }
-  }
-
-  // Local/Sandbox data layer
-  const profile = store.profiles.get(userId);
-  const email = (userEmail || profile?.email || (store.current_session?.id === userId ? store.current_session?.email : '') || '').toLowerCase().trim();
-
-  const isAllowlisted = Boolean(email && store.admin_allowlist.has(email));
-  if (!isAllowlisted) {
-    return { isAdmin: false, reason: 'NOT_ON_ALLOWLIST' };
-  }
-
-  // If email is in allowlist, ensure user_roles has admin
-  store.user_roles.set(userId, 'admin');
-
-  return { isAdmin: true };
-}
-
 // ---------------- ADMIN API (SECURED / ROLE & ALLOWLIST CHECKED) ----------------
 
 app.get('/api/admin/check-role/:id', async (req: Request, res: Response) => {
-  const userId = req.params.id;
-  const userEmail = (req.query.email as string) || '';
-  const result = await verifyIsAdmin(userId, userEmail);
+  const approved = supabaseAdmin && await isApprovedAdmin(supabaseAdmin, res.locals.authUser);
 
-  res.json({ 
-    isAdmin: result.isAdmin, 
-    role: result.isAdmin ? 'admin' : 'investor' 
+  res.json({
+    isAdmin: Boolean(approved),
+    role: approved ? 'admin' : 'investor'
   });
 });
 
@@ -2217,7 +824,7 @@ app.get('/api/admin/overview', async (req: Request, res: Response) => {
   }
 
   const pendingOPayCount = store.opay_receipts.filter((r) => r.status === 'pending').length;
-  
+
   const todayStr = new Date().toISOString().split('T')[0];
   const activeInvestments = uniqueActiveInvestments().filter((inv) => {
     ensureInvestmentPayoutSchedule(inv);
@@ -2353,7 +960,7 @@ app.get('/api/admin/investors', async (req: Request, res: Response) => {
     const bankDetails = store.bank_details.get(prof.id) || null;
     const cardDetails = store.card_details.get(prof.id) || null;
     const investment = store.investments.get(prof.id) || null;
-    
+
     const profEmail = (prof.email || '').toLowerCase().trim();
     const userPayments = store.payments.filter((p) => p.user_id === prof.id || (profEmail && p.user_email?.toLowerCase() === profEmail));
     const userPayouts = store.payouts.filter((p) => p.user_id === prof.id || (profEmail && p.user_email?.toLowerCase() === profEmail));
@@ -2438,7 +1045,7 @@ app.delete('/api/admin/investors/:id', async (req: Request, res: Response) => {
       await supabaseAdmin.from('opay_receipts').delete().eq('user_id', userId);
       await supabaseAdmin.from('user_roles').delete().eq('user_id', userId);
       await supabaseAdmin.from('notifications').delete().eq('target_user_id', userId);
-      
+
       // Delete profile record
       const { error: deleteProfErr } = await supabaseAdmin.from('profiles').delete().eq('id', userId);
       if (deleteProfErr) {
@@ -2528,7 +1135,7 @@ app.get('/api/admin/payments', async (req: Request, res: Response) => {
     }
     return {
       ...p,
-      reference: p.flutterwave_tx_ref || p.reference || p.id,
+      reference: p.provider_reference || p.reference || p.id,
       payment_method: p.method || p.payment_method || 'card',
       investor_name: profile?.name || p.user_email || 'Investor',
       investor_email: profile?.email || p.user_email || '—',
@@ -2568,7 +1175,7 @@ app.get('/api/admin/payouts', async (req: Request, res: Response) => {
   }
 
   const todayStr = new Date().toISOString().split('T')[0];
-  
+
   const dueToday: any[] = [];
   const upcoming: any[] = [];
 
@@ -2589,13 +1196,17 @@ app.get('/api/admin/payouts', async (req: Request, res: Response) => {
       investorName: profile?.name || profile?.email || 'Investor',
       investorEmail: profile?.email || '—',
       amount: due.amount,
+      suggestedAmount: due.amount,
+      amountInvested: Number(inv.amount || profile?.total_invested || 0),
       payoutPhase: due.phase,
       payoutLabel: due.label,
       interestComponent: due.interestComponent,
       principalComponent: due.principalComponent,
       nextPaymentDate: normalizeDateOnly(inv.next_payment_date) || todayStr,
-      hasBeneficiary: Boolean(bankDetails?.account_number && bankDetails?.bank_code),
-      bankName: bankDetails?.bank_name || null,
+      hasBeneficiary: hasValidPayoutDestination(bankDetails),
+      bankName: bankDetails?.bank_name || bankDetails?.iban || null,
+      bankCountry: bankDetails?.country || 'NG',
+      bankAccountLast4: String(bankDetails?.account_number || bankDetails?.iban || '').slice(-4) || null,
       bankDetails,
       hasPaidIn,
     };
@@ -2626,540 +1237,6 @@ app.get('/api/admin/payouts', async (req: Request, res: Response) => {
   });
 });
 
-// Toggle payout mode (Automatic vs Manual)
-app.post('/api/admin/payout-mode', async (req: Request, res: Response) => {
-  try {
-    const { mode, adminName } = req.body || {};
-    const normalized = String(mode || '').toLowerCase().trim();
-    if (normalized !== 'automatic' && normalized !== 'manual') {
-      return res.status(400).json({ message: 'Invalid payout mode. Must be "automatic" or "manual".' });
-    }
-
-    const prevMode = store.platform_settings.payout_mode;
-    const timestamp = new Date().toISOString();
-
-    store.platform_settings.payout_mode = normalized as 'automatic' | 'manual';
-    store.platform_settings.updated_by = adminName || 'Admin';
-    store.platform_settings.updated_at = timestamp;
-
-    let persisted = !isLiveSupabase;
-    if (isLiveSupabase && supabaseAdmin) {
-      try {
-        const { error: dbError } = await supabaseAdmin.from('platform_settings').upsert(
-          {
-            key: 'payout_mode',
-            value: { mode: normalized, updated_by: adminName || 'Admin' },
-            updated_at: timestamp,
-          },
-          { onConflict: 'key' }
-        );
-        if (dbError) {
-          console.warn('payout_mode upsert notice:', dbError.message);
-        } else {
-          persisted = true;
-        }
-      } catch (err) {
-        console.warn('Failed to persist payout_mode:', err);
-      }
-    }
-
-    // Memory remains source of truth after explicit admin toggle
-    store.platform_settings.payout_mode = normalized as 'automatic' | 'manual';
-
-    await logActivity(
-      adminName || 'Admin',
-      'PAYOUT_MODE_SWITCHED',
-      `Switched platform payout mode from ${prevMode.toUpperCase()} to ${normalized.toUpperCase()}`
-    );
-
-    // When enabling automatic mode, warn investors missing bank details
-    if (normalized === 'automatic') {
-      for (const inv of store.investments.values()) {
-        if (inv.status !== 'active') continue;
-        const bank = getBankDetailsForUser(inv.user_id);
-        if (!bank?.account_number || !bank?.bank_code) {
-          notifyInvestor(
-            inv.user_id,
-            'Update your bank details',
-            'Automatic payouts are enabled. Add a valid local bank account in your dashboard so we can send your returns. Wrong or missing details will block payouts.',
-            'alert'
-          );
-        }
-      }
-    }
-
-    return res.json({
-      success: true,
-      mode: normalized,
-      persisted,
-      message: `Payout mode set to ${normalized}`,
-    });
-  } catch (err: any) {
-    console.error('payout-mode toggle error:', err);
-    return res.status(500).json({ message: err.message || 'Failed to switch payout mode' });
-  }
-});
-
-// Manual Payout Execution (Admin Mark As Paid with reference note)
-app.post('/api/admin/payouts/manual-pay', async (req: Request, res: Response) => {
-  const { userId, amount, adminName, referenceNote } = req.body;
-  if (!userId || !referenceNote) {
-    return res.status(400).json({ message: 'User and reference note are required' });
-  }
-
-  // Prefer canonical profile id map entry
-  let investment = store.investments.get(String(userId));
-  if (!investment) {
-    const profile = store.profiles.get(String(userId));
-    if (profile?.id) investment = store.investments.get(String(profile.id));
-  }
-  if (!investment) {
-    investment = uniqueActiveInvestments().find((inv) => String(inv.user_id) === String(userId));
-  }
-  if (!investment || investment.status !== 'active') {
-    return res.status(404).json({ message: 'Active investment not found for this investor' });
-  }
-
-  const due = computePayoutForInvestment(investment);
-  const payAmount = Number(amount) > 0 ? Number(amount) : due.amount;
-  const bank = getBankDetailsForUser(userId);
-
-  const payout = {
-    id: `po-${Date.now()}`,
-    user_id: userId,
-    amount: payAmount,
-    mode: 'manual',
-    status: 'successful',
-    flutterwave_transfer_id: `MANUAL_REF_${Date.now()}`,
-    processed_at: new Date().toISOString(),
-    processed_by: adminName || 'Admin Ops',
-    notes: `${referenceNote} · ${due.label}${bank?.bank_name ? ` · ${bank.bank_name}` : ''}`,
-    payout_phase: due.phase,
-  };
-
-  store.payouts.unshift(payout);
-  advanceInvestmentAfterPayout(investment);
-  const updatedNextPaymentDate = investment.next_payment_date || null;
-
-  notifyInvestor(
-    userId,
-    due.week === 4 ? 'Week 4 payout + interest received' : `Week ${due.week} payout received`,
-    `₦${payAmount.toLocaleString()} was marked paid (${due.label}). Next payout date: ${updatedNextPaymentDate || '—'}.`,
-    'check'
-  );
-
-  if (isLiveSupabase && supabaseAdmin && isValidUUID(userId)) {
-    try {
-      await supabaseAdmin.from('payouts').insert({
-        user_id: userId,
-        amount: payAmount,
-        mode: 'manual',
-        status: 'successful',
-        flutterwave_transfer_id: payout.flutterwave_transfer_id,
-        processed_at: payout.processed_at,
-        notes: payout.notes,
-      });
-
-      if (updatedNextPaymentDate) {
-        await supabaseAdmin.from('investments').update({
-          next_payment_date: updatedNextPaymentDate,
-        }).eq('user_id', userId);
-      }
-    } catch (err) {
-      console.error('Failed to record manual payout in Supabase:', err);
-    }
-  }
-
-  const profile = store.profiles.get(userId);
-  await logActivity(
-    adminName || 'Admin',
-    'MANUAL_PAYOUT_DISBURSED',
-    `Disbursed manual ${due.phase} payout of ₦${payAmount.toLocaleString()} to ${profile?.name || userId}. Note: ${referenceNote}`,
-    payAmount
-  );
-
-  res.json(payout);
-});
-
-/** Manual batch: pay selected investors or everyone currently due */
-app.post('/api/admin/payouts/manual-batch', async (req: Request, res: Response) => {
-  const { userIds, payAllDue, adminName, referenceNote } = req.body || {};
-  if (!referenceNote || !String(referenceNote).trim()) {
-    return res.status(400).json({ message: 'A reference note is required for manual payouts' });
-  }
-
-  const todayStr = new Date().toISOString().split('T')[0];
-  let targets: string[] = [];
-
-  if (payAllDue) {
-    targets = uniqueActiveInvestments()
-      .filter((inv) => isPayoutDue(inv.next_payment_date))
-      .map((inv) => inv.user_id);
-  } else if (Array.isArray(userIds) && userIds.length > 0) {
-    targets = userIds.map(String);
-  } else {
-    return res.status(400).json({ message: 'Provide userIds[] or set payAllDue=true' });
-  }
-
-  const results: Array<{ userId: string; status: string; amount?: number; message?: string }> = [];
-
-  for (const userId of targets) {
-    const investment = store.investments.get(userId);
-    if (!investment || investment.status !== 'active') {
-      results.push({ userId, status: 'skipped', message: 'No active investment' });
-      continue;
-    }
-
-    const due = computePayoutForInvestment(investment);
-    const bank = getBankDetailsForUser(userId);
-    if (!bank?.account_number || !bank?.bank_code) {
-      notifyInvestor(
-        userId,
-        'Payout blocked — wrong/missing bank details',
-        'Admin attempted a payout but your local bank details are missing or incomplete. Update Opay / First Bank / your bank account in the dashboard.',
-        'alert'
-      );
-      results.push({ userId, status: 'failed', message: 'Missing bank details — investor notified' });
-      continue;
-    }
-
-    const payout = {
-      id: `po-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`,
-      user_id: userId,
-      amount: due.amount,
-      mode: 'manual',
-      status: 'successful',
-      flutterwave_transfer_id: `MANUAL_BATCH_${Date.now()}`,
-      processed_at: new Date().toISOString(),
-      processed_by: adminName || 'Admin Ops',
-      notes: `${String(referenceNote).trim()} · ${due.label} · ${bank.bank_name || 'Local bank'} ••••${String(bank.account_number).slice(-4)}`,
-      payout_phase: due.phase,
-    };
-    store.payouts.unshift(payout);
-    advanceInvestmentAfterPayout(investment);
-    notifyInvestor(
-      userId,
-      due.week === 4 ? 'Week 4 payout + interest sent' : `Week ${due.week} payout sent`,
-      `₦${due.amount.toLocaleString()} (${due.label}) was paid to your ${bank.bank_name || 'bank'} account.`,
-      'check'
-    );
-    results.push({ userId, status: 'paid', amount: due.amount });
-  }
-
-  await logActivity(
-    adminName || 'Admin',
-    'MANUAL_PAYOUT_BATCH',
-    `Batch manual payouts: ${results.filter((r) => r.status === 'paid').length} paid / ${results.length} targeted. Note: ${referenceNote}`
-  );
-
-  res.json({
-    success: true,
-    paid: results.filter((r) => r.status === 'paid').length,
-    failed: results.filter((r) => r.status === 'failed').length,
-    skipped: results.filter((r) => r.status === 'skipped').length,
-    results,
-  });
-});
-
-// Automated Daily Cron / Edge Function Payout Runner
-app.post('/api/payouts/run-cron', async (req: Request, res: Response) => {
-  const { triggeredBy, adminName } = req.body || {};
-  const logs: string[] = [];
-  const currentMode = store.platform_settings.payout_mode;
-  const actor = adminName || triggeredBy || 'Automated Payout Engine';
-
-  logs.push(`[${new Date().toISOString()}] Initiating payout cycle. Mode: ${currentMode.toUpperCase()}`);
-
-  const activeInvestments = uniqueActiveInvestments().filter((inv) => {
-    ensureInvestmentPayoutSchedule(inv);
-    if (!inv.next_payment_date) {
-      inv.next_payment_date = addDaysIso(inv.cycle_start_date || new Date(), 7);
-      store.investments.set(inv.user_id, inv);
-    }
-    return isPayoutDue(inv.next_payment_date);
-  });
-
-  let eligibleCount = 0;
-  let successfulTransfers = 0;
-  let failedTransfers = 0;
-  let queuedForManual = 0;
-
-  for (const inv of activeInvestments) {
-    const profile = store.profiles.get(inv.user_id);
-    const investorName = profile?.name || profile?.email || inv.user_id;
-
-    if (!investorHasSuccessfulPayment(inv.user_id)) {
-      logs.push(`Skipping ${investorName}: No verified contribution found in current cycle.`);
-      logActivity('Payout Automation', 'PAYOUT_SKIPPED', `Skipped ${investorName} — no confirmed contribution record`);
-      continue;
-    }
-
-    eligibleCount++;
-    const due = computePayoutForInvestment(inv);
-    const payoutAmount = due.amount;
-
-    if (currentMode === 'manual') {
-      queuedForManual++;
-      logs.push(`Queued ${investorName} for manual admin disbursement (₦${payoutAmount.toLocaleString()} · ${due.label}).`);
-      continue;
-    }
-
-    // Automatic mode — Stripe Connect Transfer to investor's local bank (worldwide)
-    const bankDetails = getBankDetailsForUser(inv.user_id);
-    const stripeAccountId = bankDetails?.stripe_account_id || null;
-
-    if (!stripeAccountId && (!bankDetails?.account_number || !bankDetails?.bank_code)) {
-      failedTransfers++;
-      notifyInvestor(
-        inv.user_id,
-        'Payout blocked — connect your bank',
-        'We could not send your automatic payout. Open Me → Connect payout bank with Stripe and link your local bank (Nigeria, US, EU, UK, etc.).',
-        'alert'
-      );
-      logs.push(`[FAILED] ${investorName}: No Stripe Connect / bank on file. Investor notified.`);
-      logActivity('Payout Automation', 'PAYOUT_FAILED', `No Connect payout account for ${investorName}`);
-      continue;
-    }
-
-    let transferSuccessful = false;
-    let transferId = `payout_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`;
-    let failureReason = 'Transfer could not be completed';
-
-    // Prefer Stripe Connect (pays connected account → their local bank in any country)
-    if (stripeAccountId && isStripeConfigured()) {
-      const stripeResult = await sendInvestorPayout({
-        amountMajor: payoutAmount,
-        currency: bankDetails?.currency || currencyForCountry(bankDetails?.country || 'NG'),
-        stripeAccountId,
-        description: `Sigmawealth ${due.label} payout`,
-        metadata: {
-          userId: String(inv.user_id),
-          phase: String(due.phase || ''),
-          week: String(due.week || ''),
-        },
-      });
-      if (stripeResult.success) {
-        transferSuccessful = true;
-        transferId = stripeResult.transferId;
-        logs.push(`[STRIPE] Transferred to Connect ${stripeAccountId} (${stripeResult.currency || 'ngn'})`);
-      } else {
-        failureReason = stripeResult.message || 'Stripe Connect transfer failed';
-        logs.push(`[STRIPE FAIL] ${investorName}: ${failureReason}`);
-      }
-    } else if (isFlutterwaveConfigured() && bankDetails?.account_number && bankDetails?.bank_code) {
-      // Legacy NG Flutterwave path only when Connect is missing
-      let accountVerified = false;
-      try {
-        await resolveBankAccount(String(bankDetails.account_number), String(bankDetails.bank_code));
-        accountVerified = true;
-      } catch (err: any) {
-        failureReason = err.message || 'Bank account verification failed';
-        if (!isSandboxMode()) {
-          failedTransfers++;
-          notifyInvestor(
-            inv.user_id,
-            'Payout blocked — wrong bank details',
-            `Automatic payout failed: ${failureReason}. Reconnect your bank with Stripe Connect.`,
-            'alert'
-          );
-          logs.push(`[FAILED] ${investorName}: ${failureReason}`);
-          continue;
-        }
-        logs.push(`[SANDBOX] Bank verify soft-fail for ${investorName}: ${failureReason}`);
-        accountVerified = true;
-      }
-
-      if (accountVerified) {
-        try {
-          const trfData = await createDirectTransfer({
-            amount: payoutAmount,
-            accountNumber: String(bankDetails.account_number),
-            bankCode: String(bankDetails.bank_code),
-            narration: `Sigmawealth ${due.label}`,
-            reference: transferId,
-          });
-          transferSuccessful = true;
-          transferId = String(trfData?.id || transferId);
-        } catch (err: any) {
-          if (isSandboxMode()) {
-            transferSuccessful = true;
-            logs.push(`[SANDBOX] Transfer API error ignored for test: ${err.message}`);
-          } else {
-            failureReason = err.message || 'Transfers API network error';
-            logs.push(`Transfers API network error: ${failureReason}`);
-          }
-        }
-      }
-    } else {
-      failureReason =
-        'Stripe Connect not linked. Investor must complete Connect payout onboarding for their country.';
-      logs.push(`[FAILED] ${investorName}: ${failureReason}`);
-    }
-
-    if (transferSuccessful) {
-      successfulTransfers++;
-      const bankLabel = bankDetails?.bank_name || bankDetails?.country || 'connected bank';
-      const last4 = bankDetails?.account_number
-        ? `••••${String(bankDetails.account_number).slice(-4)}`
-        : 'Stripe Connect';
-      const payout = {
-        id: `po-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
-        user_id: inv.user_id,
-        amount: payoutAmount,
-        mode: 'automatic',
-        status: 'successful',
-        flutterwave_transfer_id: String(transferId),
-        stripe_transfer_id: String(transferId),
-        processed_at: new Date().toISOString(),
-        processed_by: actor,
-        notes: `Automated ${due.label} via Stripe Connect → ${bankLabel} (${last4})`,
-        payout_phase: due.phase,
-      };
-      store.payouts.unshift(payout);
-
-      notifyInvestor(
-        inv.user_id,
-        due.week === 4 ? 'Week 4 payout + interest sent' : `Week ${due.week} payout sent`,
-        `₦${payoutAmount.toLocaleString()} (${due.label}) was sent to your local bank via Stripe Connect.`,
-        'check'
-      );
-
-      advanceInvestmentAfterPayout(inv);
-
-      logActivity(
-        'Payout Automation',
-        'AUTOMATIC_PAYOUT_SUCCESS',
-        `Disbursed ₦${payoutAmount.toLocaleString()} (${due.label}) to ${investorName} via Stripe Connect #${transferId}`,
-        payoutAmount
-      );
-      logs.push(`[SUCCESS] Transferred ₦${payoutAmount.toLocaleString()} (${due.label}) to ${investorName}. Next payout: ${inv.next_payment_date}`);
-    } else {
-      failedTransfers++;
-      notifyInvestor(
-        inv.user_id,
-        'Payout failed — reconnect bank',
-        `We could not complete your automatic payout (${failureReason}). Open Me → Connect payout bank with Stripe for your country.`,
-        'alert'
-      );
-      const payout = {
-        id: `po-${Date.now()}-${Math.random().toString(36).substring(2, 5)}`,
-        user_id: inv.user_id,
-        amount: payoutAmount,
-        mode: 'automatic',
-        status: 'failed',
-        flutterwave_transfer_id: null,
-        processed_at: new Date().toISOString(),
-        processed_by: actor,
-        notes: failureReason,
-        payout_phase: due.phase,
-      };
-      store.payouts.unshift(payout);
-      logActivity(
-        'Payout Automation',
-        'AUTOMATIC_PAYOUT_FAILED',
-        `Failed automated transfer of ₦${payoutAmount.toLocaleString()} to ${investorName}. ${failureReason}`,
-        payoutAmount
-      );
-      logs.push(`[FAILED] Automatic payout failed for ${investorName}.`);
-    }
-  }
-
-  const batchRecord = {
-    id: `batch-${Date.now()}`,
-    timestamp: new Date().toISOString(),
-    total: eligibleCount,
-    success: successfulTransfers,
-    failed: failedTransfers,
-  };
-  store.payout_batches.unshift(batchRecord);
-  if (store.payout_batches.length > 30) store.payout_batches.pop();
-
-  logActivity(
-    actor,
-    'PAYOUT_BATCH_COMPLETED',
-    `Payout cycle finished. Eligible: ${eligibleCount}, Success: ${successfulTransfers}, Failed: ${failedTransfers}, Queued Manual: ${queuedForManual}`
-  );
-
-  res.json({
-    runTimestamp: new Date().toISOString(),
-    payoutMode: currentMode,
-    totalChecked: activeInvestments.length,
-    eligibleCount,
-    successfulTransfers,
-    failedTransfers,
-    queuedForManual,
-    logs,
-  });
-});
-
-/** Local/dev helper: seed a funded investment so payout flows can be verified without completing 3DS. */
-app.post('/api/admin/dev/seed-investment', async (req: Request, res: Response) => {
-  if (process.env.NODE_ENV === 'production' && process.env.ALLOW_DEV_SEED !== '1') {
-    return res.status(404).json({ message: 'Not found' });
-  }
-
-  const { userId, amount, dueToday, payoutPhase } = req.body || {};
-  if (!userId || !amount || Number(amount) <= 0) {
-    return res.status(400).json({ message: 'userId and positive amount are required' });
-  }
-
-  const profile = store.profiles.get(String(userId));
-  if (!profile) {
-    return res.status(404).json({ message: 'Investor profile not found' });
-  }
-
-  const principal = Number(amount);
-  const now = new Date();
-  const week = normalizePayoutWeek(payoutPhase || 'week1');
-  const phase = `week${week}`;
-  const nextDate = dueToday ? now.toISOString().split('T')[0] : addDaysIso(now, week * 7);
-
-  const payment = {
-    id: `pay-seed-${Date.now()}`,
-    user_id: profile.id,
-    user_email: profile.email,
-    amount: principal,
-    method: 'card',
-    flutterwave_tx_ref: `SEED_${Date.now()}`,
-    flutterwave_ref: `SEED_${Date.now()}`,
-    reference: `SEED_${Date.now()}`,
-    status: 'successful',
-    notes: 'Dev seed payment',
-    created_at: now.toISOString(),
-  };
-  store.payments.unshift(payment);
-
-  profile.total_invested = Number(profile.total_invested || 0) + principal;
-  profile.current_phase = profile.current_phase || 'Active Plan';
-  store.profiles.set(profile.id, profile);
-
-  const investment = {
-    id: `inv-seed-${Date.now()}`,
-    user_id: profile.id,
-    amount: Number(profile.total_invested) || principal,
-    phase: 'Active Plan',
-    type: 'one-time',
-    status: 'active',
-    start_date: now.toISOString(),
-    cycle_start_date: now.toISOString(),
-    payout_phase: phase,
-    next_payment_date: nextDate,
-    cycle_count: 1,
-    created_at: now.toISOString(),
-  };
-  store.investments.set(profile.id, investment);
-  if (userId !== profile.id) store.investments.set(String(userId), investment);
-
-  const due = computePayoutForInvestment(investment);
-  res.json({
-    success: true,
-    investment,
-    payment,
-    nextDue: due,
-  });
-});
-
-// OPay Receipts Review tab
 app.get('/api/admin/opay-receipts', (req: Request, res: Response) => {
   const enriched = store.opay_receipts.map((r) => {
     let prof = store.profiles.get(r.user_id);
@@ -3179,182 +1256,6 @@ app.get('/api/admin/opay-receipts', (req: Request, res: Response) => {
     };
   });
   res.json(enriched);
-});
-
-app.post('/api/admin/opay-receipts/review', async (req: Request, res: Response) => {
-  const { receiptId, decision, adminName, adminNotes } = req.body;
-  if (!receiptId || !decision) {
-    return res.status(400).json({ message: 'Receipt ID and review decision required' });
-  }
-
-  const receipt = store.opay_receipts.find((r) => r.id === receiptId);
-  if (!receipt) {
-    return res.status(404).json({ message: 'Receipt record not found' });
-  }
-
-  if (decision === 'rejected' && !adminNotes) {
-    return res.status(400).json({ message: 'A rejection note explaining the reason is required.' });
-  }
-
-  receipt.status = decision;
-  receipt.reviewed_by = adminName || 'Admin';
-  receipt.admin_notes = adminNotes || null;
-  receipt.reviewed_at = new Date().toISOString();
-
-  // Find profile by ID or by email
-  let profile = store.profiles.get(receipt.user_id);
-  if (!profile && receipt.user_email) {
-    for (const [_, p] of store.profiles.entries()) {
-      if (p.email && p.email.toLowerCase() === receipt.user_email.toLowerCase()) {
-        profile = p;
-        break;
-      }
-    }
-  }
-  if (!profile) {
-    for (const [_, p] of store.profiles.entries()) {
-      if (p.id === receipt.user_id) {
-        profile = p;
-        break;
-      }
-    }
-  }
-
-  const targetPhase = receipt.target_phase || 'Phase 1: Seed Accumulation';
-  const investorName = profile?.name || receipt.user_email || receipt.user_id;
-
-  if (decision === 'approved') {
-    const verifiedAmount = Number(receipt.amount);
-
-    // 1. Record verified payment
-    const payment = {
-      id: `pay-${Date.now()}`,
-      user_id: receipt.user_id,
-      user_email: receipt.user_email || profile?.email || '',
-      amount: verifiedAmount,
-      method: 'opay_transfer',
-      flutterwave_tx_ref: `OPAY_MANUAL_${receipt.id}`,
-      status: 'successful',
-      notes: `Verified OPay Transfer (${targetPhase}) by ${adminName || 'Admin'}`,
-      created_at: new Date().toISOString(),
-    };
-    store.payments.unshift(payment);
-
-    // 2. Update or create investment
-    let investment = store.investments.get(receipt.user_id);
-    if (!investment && profile?.id) {
-      investment = store.investments.get(profile.id);
-    }
-    const now = new Date();
-
-    if (investment) {
-      investment.amount = Number(investment.amount) + verifiedAmount;
-      investment.phase = targetPhase;
-      investment.status = 'active';
-      ensureInvestmentPayoutSchedule(investment);
-    } else {
-      investment = {
-        id: `inv-${Date.now()}`,
-        user_id: receipt.user_id,
-        amount: verifiedAmount,
-        phase: targetPhase,
-        type: 'opay',
-        status: 'active',
-        start_date: now.toISOString(),
-        cycle_start_date: now.toISOString(),
-        payout_phase: 'week1',
-        next_payment_date: addDaysIso(now, 7),
-        cycle_count: 1,
-        created_at: now.toISOString(),
-      };
-    }
-    store.investments.set(receipt.user_id, investment);
-    if (profile?.id && profile.id !== receipt.user_id) {
-      store.investments.set(profile.id, investment);
-    }
-
-    // 3. Update profile
-    if (!profile) {
-      profile = {
-        id: receipt.user_id,
-        name: investorName,
-        email: receipt.user_email || '',
-        phone: '',
-        total_invested: verifiedAmount,
-        current_phase: targetPhase,
-        payment_plan_id: null,
-        created_at: new Date().toISOString(),
-      };
-      store.profiles.set(receipt.user_id, profile);
-    } else {
-      profile.total_invested = Number(profile.total_invested || 0) + verifiedAmount;
-      profile.current_phase = targetPhase;
-      store.profiles.set(profile.id, profile);
-      if (receipt.user_id !== profile.id) {
-        store.profiles.set(receipt.user_id, profile);
-      }
-    }
-
-    // 4. If Supabase is connected, sync to database
-    if (isLiveSupabase && supabaseAdmin) {
-      try {
-        const dbUserId = isValidUUID(receipt.user_id) ? receipt.user_id : (profile?.id && isValidUUID(profile.id) ? profile.id : null);
-        if (dbUserId) {
-          await supabaseAdmin.from('profiles').upsert({
-            id: dbUserId,
-            name: profile.name,
-            email: profile.email,
-            phone: profile.phone,
-            total_invested: profile.total_invested,
-            current_phase: targetPhase,
-          });
-          await supabaseAdmin.from('investments').upsert({
-            id: investment.id,
-            user_id: dbUserId,
-            amount: investment.amount,
-            phase: targetPhase,
-            type: 'opay',
-            status: 'active',
-            start_date: investment.start_date,
-            next_payment_date: investment.next_payment_date,
-            cycle_count: investment.cycle_count || 1,
-          });
-          await supabaseAdmin.from('payments').insert({
-            id: payment.id,
-            user_id: dbUserId,
-            amount: verifiedAmount,
-            method: 'opay_transfer',
-            flutterwave_tx_ref: payment.flutterwave_tx_ref,
-            status: 'successful',
-            notes: payment.notes,
-            created_at: payment.created_at,
-          });
-          await supabaseAdmin.from('opay_receipts').update({
-            status: 'approved',
-            reviewed_by: adminName || 'Admin',
-            reviewed_at: new Date().toISOString(),
-          }).eq('id', receipt.id);
-        }
-      } catch (dbErr) {
-        console.warn('Supabase sync error on OPay review:', dbErr);
-      }
-    }
-
-    logActivity(
-      adminName || 'Admin',
-      'OPAY_RECEIPT_APPROVED',
-      `Approved OPay receipt of ₦${verifiedAmount.toLocaleString()} for ${investorName} (${targetPhase})`,
-      verifiedAmount
-    );
-  } else {
-    logActivity(
-      adminName || 'Admin',
-      'OPAY_RECEIPT_REJECTED',
-      `Rejected OPay receipt for ${investorName}. Reason: ${adminNotes}`
-    );
-  }
-
-  res.json({ success: true, receipt });
 });
 
 app.get('/api/admin/notifications', async (req: Request, res: Response) => {

@@ -1,0 +1,35 @@
+SigmawealthSolution production check — 13 October 2026
+
+IMPLEMENTED
+Frontend and API accept only NGN 64,000, 98,550, 135,000, 540,000 or 2,160,000 per funding request. Altered amounts are rejected before a provider checkout is created. First-time monthly enrollment uses the selected amount. Bachs fees must be paid by the company, preserving the exact customer amount.
+Old payment integrations and local authentication/seed handlers have been removed. Admin routes require a verified Supabase session, confirmed email, allowlist entry and admin role. Investor and support requests require ownership. Financial records cannot be written by browser credentials after the required migration.
+
+TEST RESULTS
+16 backend PostgreSQL/API/security tests passed, including amount tampering, ownership, forged webhooks, repeated settlement, referral rewards and pending bank payout handling.
+Type checking, lint and production frontend/API builds passed. Production API smoke checks returned the expected 401/403/400/410 responses, and the source secret scan passed.
+Both repositories have zero known production dependency advisories. The backend full audit also reports zero. The frontend full audit has 10 build/lint dependency advisories (7 high, 3 moderate); this is not a guarantee that the entire system has no vulnerabilities. Details are in npm-audit-all.json.
+
+REAL LIVE-KEY TEST
+The key authenticated successfully. All FIVE actual checkout creation requests were refused by Bachs with ACCOUNT_NOT_ACTIVATED. No money moved. No successful live payment, card debit or bank withdrawal is claimed.
+Connect is inactive; only the conversions capability was enabled. NGN card and bank transfer settings were enabled, with org_pays fees. The configured webhook was enabled with event source all.
+Both deployed hosts were still serving the old API when tested; their unauthenticated admin overview returned HTTP 200. The updated code requires HTTP 401. Recheck deployment after updating both hosts.
+
+REQUIRED UPDATES
+1. Complete Bachs account onboarding and obtain live payment activation. Obtain Bachs' explicit acceptance of this investment business: its published policy lists investment funds and high-yield programs as prohibited. A smaller ROI does not remove that restriction.
+2. Enable Bachs Connect, finish its requirements and onboard each investor's recipient account and approved NGN bank destination.
+3. In the Supabase SQL Editor, apply supabase/bachs.sql, then supabase/financial-permissions.sql. The live database had the Bachs tables, but the financial protection health RPC was missing (PGRST202). Payment operations are blocked until the complete migration is present.
+4. Deploy the separate Sigmawealthsolutionbackend and Sigmawealthsolution frontend repositories, backend first. They have separate commits. On Render set BACHS_API_KEY, BACHS_WEBHOOK_SECRET, NEXT_PUBLIC_SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY. Set FRONTEND_URL=https://sigmawealthsolution.com and PUBLIC_API_URL=https://sigmawealthsolutionbackend.onrender.com. Keys belong in Render environment settings, never in frontend source.
+5. On the frontend host set SIGMA_API_URL=https://sigmawealthsolutionbackend.onrender.com and the existing public Supabase URL/anon key.
+6. After approval, activation, migration, sandbox settlement testing and recipient verification, enable the approved automatic runner: matching BACHS_CRON_SECRET in Render and the BACKEND repository GitHub Actions secrets, backend repository SIGMA_API_URL secret, BACHS_BUSINESS_APPROVED=1 and BACHS_AUTOMATION_ENABLED=1 on Render, repository BACHS_AUTOMATION_ENABLED variable=true, and automatic payout mode in the admin panel. These remain disabled pending readiness.
+
+Webhook URL: https://sigmawealthsolutionbackend.onrender.com/api/bachs/webhook
+Event source: all
+Official policy: https://docs.bachs.io/for-you/supported-businesses
+Detailed deployment instructions: README.md
+
+ACTUAL REPOSITORY LOCATIONS
+Frontend: C:\Users\DELL\nextrend-website-1- (GitHub emmanuel582/Sigmawealthsolution)
+Backend: C:\Users\DELL\Sigmawealthsolutionbackend (GitHub emmanuel582/Sigmawealthsolutionbackend)
+Backend source, migrations, payment tests and scheduled workflow now belong in that separate backend repository. The previous locally modified backend build was preserved in its ignored .codex-backups/sigma-api-before-bachs.js file.
+
+The existing day-before card debit reminder was migrated to a persistent, deduplicated notification. It is part of the disabled backend runner. Frontend types, lint, build and production funding-card render checks passed independently.

@@ -10,7 +10,7 @@ export function getAllowedOrigins(): string[] {
     .map((s) => s.trim())
     .filter(Boolean);
   const appUrl = (process.env.APP_URL || process.env.FRONTEND_URL || '').replace(/\/$/, '');
-  const defaults = process.env.NODE_ENV === 'production' ? ['https://sigmawealthsolution.com'] : ['http://localhost:3000', 'http://127.0.0.1:3000'];
+  const defaults = process.env.NODE_ENV === 'production' ? ['https://sigmawealthsolution.com', 'https://www.sigmawealthsolution.com'] : ['http://localhost:3000', 'http://127.0.0.1:3000'];
   return Array.from(new Set([...defaults, ...fromEnv, ...(appUrl ? [appUrl] : [])]));
 }
 

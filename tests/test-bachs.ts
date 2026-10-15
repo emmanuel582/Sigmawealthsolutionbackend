@@ -6,6 +6,7 @@ import { PGlite } from '@electric-sql/pglite';
 import express from 'express';
 import { decimalAmount, verifyBachsSignature, bachsRequest, BachsError } from '../server/lib/bachsPayments.js';
 import { mountBachsRoutes } from '../server/lib/bachsRoutes.js';
+import { hasPlatformPayoutCapabilities, isPlatformConnectReady } from '../server/lib/bachsCapabilities.js';
 import { FUNDING_PLAN_AMOUNTS, isFundingPlanAmount } from '../lib/sigma/fundingPlans.js';
 import { mountAuthorization, secretMatches } from '../server/lib/authorization.js';
 
@@ -421,4 +422,28 @@ test('day-before recurring reminders persist once across simultaneous runs and i
     const counts=await Promise.all(results.map(async r=>(await r.json()).sent));assert.deepEqual(counts.sort(),[0,1]);
     const rows=(await db.query<any>('SELECT * FROM notifications')).rows;assert.equal(rows.length,1);assert.equal(rows[0].target_user_id,owner);assert.match(rows[0].body,/64,000/);assert.match(rows[0].body,/cancel/);
   } finally {if(oldKey===undefined)delete process.env.BACHS_API_KEY;else process.env.BACHS_API_KEY=oldKey;await new Promise<void>(r=>server.close(()=>r()));await db.close();}
+});
+
+test('approved platform capabilities and recipient access are checked without an invented connect flag', async () => {
+  const approved={is_active:true,enabled_capabilities:['ngn_card_collection','payouts','transfers']};
+  assert.equal(hasPlatformPayoutCapabilities(approved),true);
+  assert.equal(hasPlatformPayoutCapabilities({...approved,is_active:false}),false);
+  assert.equal(hasPlatformPayoutCapabilities({...approved,enabled_capabilities:['payouts']}),false);
+  assert.equal(hasPlatformPayoutCapabilities({is_active:true,enabled_capabilities:['connect']}),false);
+  const savedFetch=globalThis.fetch;const savedKey=process.env.BACHS_API_KEY;
+  process.env.BACHS_API_KEY='sk_sandbox_test';
+  try {
+    let reads=0;
+    globalThis.fetch=(async (url:any,init:any)=>{
+      assert.equal(new URL(String(url)).pathname,'/v1/accounts');
+      assert.equal(init.method,'GET');reads++;
+      return new Response('{"items":[]}',{status:200});
+    }) as typeof fetch;
+    assert.equal(await isPlatformConnectReady(approved),true);
+    assert.equal(reads,1);
+    globalThis.fetch=(async()=>new Response('{"message":"Recipient accounts unavailable"}',{status:403})) as typeof fetch;
+    assert.equal(await isPlatformConnectReady(approved),false);
+    globalThis.fetch=(async()=>new Response('{"message":"Temporary provider failure"}',{status:503})) as typeof fetch;
+    await assert.rejects(isPlatformConnectReady(approved));
+  } finally {globalThis.fetch=savedFetch;if(savedKey===undefined)delete process.env.BACHS_API_KEY;else process.env.BACHS_API_KEY=savedKey;}
 });

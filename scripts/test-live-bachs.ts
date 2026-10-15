@@ -4,13 +4,14 @@ import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import { FUNDING_PLAN_AMOUNTS } from '../lib/sigma/fundingPlans.js';
 import { bachsRequest, decimalAmount } from '../server/lib/bachsPayments.js';
+import { isPlatformConnectReady } from '../server/lib/bachsCapabilities.js';
 
 // Explicit command only: creates unpaid sessions with the configured key.
 // No saved cards, customers, charges, transfers or payouts are created.
 async function main() {
 const report: any = { testedAt: new Date().toISOString(), realProvider: true, moneyMoved: false, checkouts: [], deployment: [] };
 const account = await bachsRequest('/v1/accounts/me');
-report.account = { active: account.is_active, capabilities: account.enabled_capabilities, connectActive: Boolean(account.enabled_capabilities?.includes('connect') || account.capabilities?.connect?.status === 'active') };
+report.account = { active: account.is_active, capabilities: account.enabled_capabilities, connectActive: await isPlatformConnectReady(account) };
 const settings = await bachsRequest('/v1/accounts/checkout/settings');
 report.checkoutSettings = { feePreference: settings.fee_preference, enabledPaymentMethods: settings.enabled_payment_methods };
 for (const amount of FUNDING_PLAN_AMOUNTS) {

@@ -1,37 +1,42 @@
 {
-  "testedAt": "2026-10-13T10:24:15.981Z",
+  "testedAt": "2026-10-15T11:15:11.176Z",
   "realProvider": true,
   "moneyMoved": false,
   "checkouts": [
     {
       "amount": 64000,
-      "passed": false,
-      "code": "ACCOUNT_NOT_ACTIVATED",
-      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+      "passed": true,
+      "checkoutId": "chk_DisjRhwlf3O7o2eg",
+      "status": "open",
+      "expiresAt": "2026-10-15T12:15:18.690342Z"
     },
     {
       "amount": 98550,
-      "passed": false,
-      "code": "ACCOUNT_NOT_ACTIVATED",
-      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+      "passed": true,
+      "checkoutId": "chk_07u6PEg5lFkybsKF",
+      "status": "open",
+      "expiresAt": "2026-10-15T12:15:20.170576Z"
     },
     {
       "amount": 135000,
-      "passed": false,
-      "code": "ACCOUNT_NOT_ACTIVATED",
-      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+      "passed": true,
+      "checkoutId": "chk_rLrbpIqYdsMbfCUc",
+      "status": "open",
+      "expiresAt": "2026-10-15T12:15:21.971266Z"
     },
     {
       "amount": 540000,
-      "passed": false,
-      "code": "ACCOUNT_NOT_ACTIVATED",
-      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+      "passed": true,
+      "checkoutId": "chk_3S0hxzbhi8yGeYju",
+      "status": "open",
+      "expiresAt": "2026-10-15T12:15:24.030466Z"
     },
     {
       "amount": 2160000,
-      "passed": false,
-      "code": "ACCOUNT_NOT_ACTIVATED",
-      "message": "This account is not yet approved to accept live payments. Finish onboarding and wait for the account to be activated, or use a sandbox key to test."
+      "passed": true,
+      "checkoutId": "chk_Sf6hBvzlj36qxG9H",
+      "status": "open",
+      "expiresAt": "2026-10-15T12:15:26.046616Z"
     }
   ],
   "deployment": [
@@ -40,12 +45,20 @@
       "checks": [
         {
           "path": "/api/config",
-          "status": 200
+          "status": 200,
+          "provider": "bachs",
+          "fixedPlans": [
+            64000,
+            98550,
+            135000,
+            540000,
+            2160000
+          ]
         },
         {
           "path": "/api/admin/overview",
-          "status": 200,
-          "protected": false
+          "status": 401,
+          "protected": true
         }
       ]
     },
@@ -54,12 +67,20 @@
       "checks": [
         {
           "path": "/api/config",
-          "status": 200
+          "status": 200,
+          "provider": "bachs",
+          "fixedPlans": [
+            64000,
+            98550,
+            135000,
+            540000,
+            2160000
+          ]
         },
         {
           "path": "/api/admin/overview",
-          "status": 200,
-          "protected": false
+          "status": 401,
+          "protected": true
         }
       ]
     }
@@ -67,9 +88,15 @@
   "account": {
     "active": true,
     "capabilities": [
-      "conversions"
+      "bank_transfer",
+      "conversions",
+      "crypto",
+      "mobile_money",
+      "ngn_card_collection",
+      "payouts",
+      "transfers"
     ],
-    "connectActive": false
+    "connectActive": true
   },
   "checkoutSettings": {
     "feePreference": "org_pays",
@@ -131,5 +158,14 @@
         "enabled": true
       }
     }
+  },
+  "readinessVerifiedAt": "2026-10-15T11:24:24.124Z",
+  "readiness": {
+    "connectedAccountsAccessible": true,
+    "webhookConfigured": true,
+    "financialSchemaVersion": 2,
+    "financialWritesRestricted": true,
+    "applicationCheckoutEnabled": false,
+    "automationEnabled": false
   }
 }

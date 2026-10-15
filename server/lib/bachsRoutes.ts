@@ -2,6 +2,7 @@ import type { Express, Request, Response, NextFunction } from 'express';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import crypto from 'node:crypto';
 import { isApprovedAdmin, secretMatches } from './authorization.js';
+import { isPlatformConnectReady } from './bachsCapabilities.js';
 import { FUNDING_PLAN_AMOUNTS, FUNDING_PLAN_ERROR, getFundingPlan, isFundingPlanAmount } from '../../lib/sigma/fundingPlans.js';
 import {
   BachsError, bachsRequest, bachsWebhookSecret, bachsWebhookUrl, decimalAmount,
@@ -75,7 +76,7 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     requireBusinessApproval();
     if (process.env.BACHS_AUTOMATION_ENABLED !== '1') throw new BachsError('The live scheduled runner is disabled.',409,'AUTOMATION_DISABLED');
     const account = await bachsRequest('/v1/accounts/me');
-    if (!account.enabled_capabilities?.includes('connect') && account.capabilities?.connect?.status !== 'active') {
+    if (!await isPlatformConnectReady(account)) {
       throw new BachsError('Bachs Connect setup is incomplete.',409,'CONNECT_NOT_ACTIVE');
     }
   }
@@ -314,7 +315,7 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     // NGN investment payouts stay NGN: never guess an FX rate for an investor's returns.
     if (String(req.body.country || 'NG').toUpperCase()!=='NG') throw new BachsError('This NGN investment account currently pays out to Nigerian bank accounts.',400);
     const me = await bachsRequest('/v1/accounts/me');
-    if (!me.enabled_capabilities?.includes('connect') && me.capabilities?.connect?.status!=='active') throw new BachsError('Bachs Connect is not active on the platform account. Request it in the Bachs dashboard and complete the required verification.',409,'CONNECT_NOT_ACTIVE');
+    if (!await isPlatformConnectReady(me)) throw new BachsError('Bachs Connect is not active on the platform account. Request it in the Bachs dashboard and complete the required verification.',409,'CONNECT_NOT_ACTIVE');
     let bank = await query(db().from('bank_details').select('*').eq('user_id',user.id).maybeSingle());
     let accountId = bank?.bachs_account_id;
     if (!accountId) {
@@ -442,7 +443,7 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
   app.get('/api/bachs/readiness', endpoint(async (req,res) => {
     await runner(req); const account=await bachsRequest('/v1/accounts/me');
     await requireStorageReady();
-    const connectActive=account.enabled_capabilities?.includes('connect') || account.capabilities?.connect?.status==='active';
+    const connectActive=await isPlatformConnectReady(account);
     res.json({configured:true,sandbox:bachsApiKey().startsWith('sk_sandbox_'),webhookConfigured:Boolean(bachsWebhookSecret()),databaseReady:true,
       businessApproved:process.env.BACHS_BUSINESS_APPROVED==='1',automationEnabled:process.env.BACHS_AUTOMATION_ENABLED==='1',connectActive:Boolean(connectActive),capabilities:account.enabled_capabilities,webhookUrl:bachsWebhookUrl()});
   }));

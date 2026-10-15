@@ -16,7 +16,7 @@
     "test": "node --import tsx --test tests/test-bachs.ts tests/security.unit.test.ts",
     "test:bachs": "node --import tsx --test tests/test-bachs.ts",
     "test:live-bachs": "node --import tsx scripts/test-live-bachs.ts",
-    "check:bachs": "node scripts/check-bachs.mjs",
+    "check:bachs": "node --import tsx scripts/check-bachs.mjs",
     "check:secrets": "node scripts/check-secrets.mjs"
   },
   "dependencies": {
@@ -27,7 +27,6 @@
     "express": "^4.21.2",
     "express-rate-limit": "^8.7.0",
     "helmet": "^8.3.0",
-    "sigmawealth-solution": "file:../nextrend-website-1-",
     "xss": "^1.0.15"
   },
   "devDependencies": {

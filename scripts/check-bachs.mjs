@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import { isPlatformConnectReady } from '../server/lib/bachsCapabilities.ts';
 import { createClient } from '@supabase/supabase-js';
 const key=(process.env.BACHS_API_KEY || '').trim();
 const base=key.startsWith('sk_sandbox_')?'https://sandbox-api.bachs.io':'https://api.bachs.io';
@@ -8,7 +9,7 @@ for(const route of ['/v1/accounts/me','/v1/webhooks/endpoints']) {
   const response=await fetch(base+route,{headers:{Authorization:`Bearer ${key}`},signal:AbortSignal.timeout(20000)});
   const data=await response.json().catch(()=>({}));
   if(route.endsWith('/me')) {
-    const connect=data.enabled_capabilities?.includes('connect') || data.capabilities?.connect?.status==='active';
+    const connect=response.ok && await isPlatformConnectReady(data);
     console.log('Bachs account', {status:response.status,active:data.is_active,connectActive:Boolean(connect),sandbox:key.startsWith('sk_sandbox_')});
     if(!response.ok || !connect) ready=false;
   } else {

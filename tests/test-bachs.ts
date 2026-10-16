@@ -51,9 +51,26 @@ test('provider writes require a durable key and use the correct environment and 
     assert.equal(calls[0].init.headers['X-Account-Id'],'acct_investor');
     assert.equal(calls[0].init.headers['Idempotency-Key'],'job-1');
     assert.equal(JSON.parse(calls[0].init.body).amount,'100000.00');
+    globalThis.fetch=(async()=>new Response(JSON.stringify({detail:'account_number=0123456789 private-token',error_code:'FORBIDDEN'}),{status:403})) as typeof fetch;
+    await assert.rejects(bachsRequest('/v1/payouts'),e=>e instanceof BachsError && !e.message.includes('0123456789') && !e.message.includes('private-token'));
     globalThis.fetch=(async()=>{throw new Error('network timeout');}) as typeof fetch;
     await assert.rejects(bachsRequest('/v1/payouts',{method:'POST',idempotencyKey:'job-1',body:{amount:'100000.00'}}),e=>e instanceof BachsError && e.code==='OUTCOME_UNKNOWN');
   } finally {globalThis.fetch=oldFetch;if(oldKey===undefined) delete process.env.BACHS_API_KEY;else process.env.BACHS_API_KEY=oldKey;}
+});
+
+test('provider concurrency is bounded and capacity is released after responses',async()=>{
+  const savedFetch=globalThis.fetch;const savedKey=process.env.BACHS_API_KEY;
+  process.env.BACHS_API_KEY='sk_sandbox_test';
+  const release:Array<()=>void>=[];
+  globalThis.fetch=(async()=>new Promise<Response>(resolve=>release.push(()=>resolve(new Response('{"ok":true}',{status:200}))))) as typeof fetch;
+  try {
+    const held=Array.from({length:32},()=>bachsRequest('/v1/accounts/me'));
+    await assert.rejects(bachsRequest('/v1/accounts/me'),e=>e instanceof BachsError && e.code==='PROVIDER_BUSY');
+    assert.equal(release.length,32);
+    for(const finish of release)finish();await Promise.all(held);
+    globalThis.fetch=(async()=>new Response('{"ok":true}',{status:200})) as typeof fetch;
+    assert.deepEqual(await bachsRequest('/v1/accounts/me'),{ok:true});
+  }finally{for(const finish of release)finish();globalThis.fetch=savedFetch;if(savedKey===undefined)delete process.env.BACHS_API_KEY;else process.env.BACHS_API_KEY=savedKey;}
 });
 
 async function ledger() {
@@ -116,6 +133,7 @@ test('legacy endpoints require real sessions, ownership, allowlisted admins and 
     assert.equal(secretMatches('aa','é'),false,'UTF-8 length differences must not throw');
     await db.query("INSERT INTO admin_allowlist VALUES('owner@example.test')");
     assert.equal((await fetch(base+'/api/admin/overview',{headers})).status,200);
+    assert.equal((await fetch(base+'/api/admin/investors/'+owner,{method:'DELETE',headers})).status,409,'even admins cannot erase the ledger');
   } finally { await new Promise<void>(resolve=>server.close(()=>resolve()));await db.close(); }
 });
 
@@ -132,6 +150,12 @@ test('database credits a webhook/return race once, rejects payment ID reuse and 
     await assert.rejects(db.query("SELECT bachs_credit_payment('order-2','ch_1')"));
     assert.equal((await db.query<any>("SELECT credited FROM bachs_requests WHERE reference='order-2'")).rows[0].credited,false);
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'100000.00');
+    await db.exec("CREATE FUNCTION reject_investment_update() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'simulated crash'; END $$; CREATE TRIGGER simulated_crash BEFORE UPDATE ON investments FOR EACH ROW EXECUTE FUNCTION reject_investment_update();");
+    await db.query("INSERT INTO bachs_requests(reference,user_id,kind,amount,phase) VALUES ('crash-order',$1,'checkout',64000,'Plan')",[user]);
+    await assert.rejects(db.query("SELECT bachs_credit_payment('crash-order','ch_crash')"));
+    assert.equal((await db.query<any>("SELECT count(*) FROM payments WHERE bachs_payment_id='ch_crash'")).rows[0].count,0,'a failure after ledger insertion rolls back the entire credit');
+    assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'100000.00');
+    assert.equal((await db.query<any>("SELECT credited FROM bachs_requests WHERE reference='crash-order'")).rows[0].credited,false);
     const role=await db.query<any>("SELECT has_function_privilege('authenticated','bachs_credit_payment(text,text)','execute') AS can_execute");
     assert.equal(role.rows[0].can_execute,false);
   }finally{await db.close();}
@@ -269,7 +293,7 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
   const base=`http://127.0.0.1:${(server.address() as any).port}`;
   const realFetch=globalThis.fetch;const oldKey=process.env.BACHS_API_KEY;const oldSecret=process.env.BACHS_WEBHOOK_SECRET;
   process.env.BACHS_API_KEY='sk_sandbox_test';process.env.BACHS_WEBHOOK_SECRET='test-secret';
-  const sessions=new Map<string,any>();let checkoutCounter=0;let insecureCheckout=false;
+  const sessions=new Map<string,any>();let checkoutCounter=0;let insecureCheckout=false;let loseCheckoutResponse=false;
   const response=(data:any,status=200)=>new Response(JSON.stringify(data),{status,headers:{'Content-Type':'application/json'}});
   globalThis.fetch=(async (url:any,options:any)=>{
     if(String(url).startsWith(base))return realFetch(url,options);
@@ -281,13 +305,14 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
       const body=JSON.parse(options.body);const id='chk_'+(++checkoutCounter);
       if(body.pricing){assert.ok(isFundingPlanAmount(body.pricing.amount));assert.equal(body.pricing.currency,'NGN');}
       else assert.equal(body.save_payment_method,true);
-      sessions.set(id,{checkout_id:id,reference:body.reference,amount:body.pricing?.amount || '0.00',mode:body.pricing?'payment':'setup',currency:'NGN',status:'open',payment_status:'unpaid',charge:{payment_id:'ch_'+checkoutCounter}});
+      sessions.set(id,{checkout_id:id,checkout_url:'https://sandbox-checkout.bachs.io/c/'+id,reference:body.reference,amount:body.pricing?.amount || '0.00',mode:body.pricing?'payment':'setup',currency:'NGN',status:'open',payment_status:'unpaid',charge:{payment_id:'ch_'+checkoutCounter}});
+      if(loseCheckoutResponse)throw new Error('simulated timeout after provider accepted checkout');
       return response({checkout_id:id,checkout_url:(insecureCheckout?'http://':'https://')+'sandbox-checkout.bachs.io/c/'+id});
     }
     if(endpoint.startsWith('/v1/checkout-sessions/'))return response(sessions.get(endpoint.split('/').at(-1)!));
     throw new Error('Unexpected provider call in checkout test: '+endpoint);
   }) as typeof fetch;
-  const post=(route:string,body:any)=>fetch(base+route,{method:'POST',headers:{Authorization:'Bearer owner','Content-Type':'application/json'},body:JSON.stringify(body)});
+  const post=(route:string,body:any)=>fetch(base+route,{method:'POST',headers:{Authorization:'Bearer owner','Content-Type':'application/json'},body:JSON.stringify(route==='/api/bachs/initiate'?{idempotencyKey:crypto.randomUUID(),...body}:body)});
   try{
     assert.equal((await post('/api/bachs/initiate',{userId:'someone-else',amount:64000})).status,403);
     assert.equal((await post('/api/bachs/initiate',{userId:user,amount:50000})).status,400);
@@ -307,9 +332,26 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
       const response=await post('/api/bachs/initiate',{userId:user,amount,phase:'Plan'});
       assert.equal(response.status,200);assert.equal((await response.json()).amountCharged,amount);
     }
+    const attempt=crypto.randomUUID();
+    const intent={userId:user,amount:64000,phase:'Plan',idempotencyKey:attempt};
+    const baseline=checkoutCounter;
+    const burst=await Promise.all(Array.from({length:12},()=>post('/api/bachs/initiate',intent)));
+    assert.ok(burst.every(r=>[200,503].includes(r.status)));
+    assert.equal(checkoutCounter,baseline+1,'concurrent retries create one hosted payment session');
+    const replay=await post('/api/bachs/initiate',intent);assert.equal(replay.status,200);
+    const replayed=await replay.json();assert.equal(replayed.sessionId,'chk_'+checkoutCounter);
+    assert.equal(checkoutCounter,baseline+1,'retries after a lost HTTP response reuse the saved checkout');
+    assert.equal((await post('/api/bachs/initiate',{...intent,amount:98550})).status,409,'a retry key cannot switch amount');
+    assert.equal((await post('/api/bachs/initiate',{...intent,idempotencyKey:'bad'})).status,400);
     const pending=await post('/api/bachs/verify',{userId:user,sessionId:checkout.sessionId,txRef:checkout.reference});
     assert.equal(pending.status,202);assert.equal((await pending.json()).success,false);
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'0.00');
+    const laggedRaw=Buffer.from(JSON.stringify({id:'evt_delayed',type:'checkout.completed',data:{checkout_id:checkout.sessionId}}));
+    const laggedTime=String(Math.floor(Date.now()/1000));
+    const laggedSignature=crypto.createHmac('sha256','test-secret').update(laggedTime+'.').update(laggedRaw).digest('hex');
+    const delayed=()=>fetch(base+'/api/bachs/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Bachs-Timestamp':laggedTime,'X-Bachs-Signature':laggedSignature},body:laggedRaw});
+    assert.equal((await delayed()).status,503,'provider read lag must request a retry, not discard the event');
+    assert.equal((await db.query<any>("SELECT count(*) FROM bachs_webhook_events WHERE id='evt_delayed'")).rows[0].count,0);
     const session=sessions.get(checkout.sessionId);session.status='completed';
     for (const status of ['requires_payment_method','requires_confirmation','requires_action','processing','failed','canceled']) {
       session.payment_status=status;
@@ -327,9 +369,12 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'64000.00');
     assert.equal((await db.query<any>('SELECT count(*) FROM payments')).rows[0].count,1);
     assert.equal((await webhook()).status,200);
+    assert.equal((await delayed()).status,200,'a delayed event succeeds after provider confirmation');
     assert.equal((await db.query<any>('SELECT count(*) FROM payments')).rows[0].count,1);
     const next=await (await post('/api/bachs/initiate',{userId:user,amount:64000,phase:'Plan'})).json();
-    Object.assign(sessions.get(next.sessionId),{status:'completed',payment_status:'succeeded',amount:'63999.00'});
+    Object.assign(sessions.get(next.sessionId),{status:'completed',payment_status:'succeeded',charge:{payment_id:'ch_underpaid',amount_paid:'63999.99',amount_remaining:'0.01'}});
+    assert.equal((await post('/api/bachs/verify',{userId:user,sessionId:next.sessionId,txRef:next.reference})).status,409,'even a completed checkout cannot credit an underpayment');
+    Object.assign(sessions.get(next.sessionId),{amount:'63999.00'});
     assert.equal((await post('/api/bachs/verify',{userId:user,sessionId:next.sessionId,txRef:next.reference})).status,409);
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'64000.00');
     const setup=await (await post('/api/bachs/initiate',{userId:user,amount:98550,monthlyPlanAmount:98550,isRecurringPlan:true,phase:'Plan'})).json();
@@ -340,6 +385,14 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'64000.00');
     assert.equal((await db.query<any>('SELECT monthly_amount FROM bachs_customers')).rows[0].monthly_amount,'98550.00');
     insecureCheckout=true;assert.equal((await post('/api/bachs/initiate',{userId:user,amount:64000,phase:'Plan'})).status,502,'unsafe provider redirects are rejected');
+    insecureCheckout=false;loseCheckoutResponse=true;
+    const uncertain={userId:user,amount:64000,idempotencyKey:crypto.randomUUID()};
+    const beforeUnknown=checkoutCounter;
+    assert.equal((await post('/api/bachs/initiate',uncertain)).status,502);
+    assert.equal((await post('/api/bachs/initiate',uncertain)).status,503);
+    assert.equal(checkoutCounter,beforeUnknown+1,'unknown checkout creation cannot silently create another payment');
+    assert.equal((await db.query<any>('SELECT count(*) FROM payments')).rows[0].count,1);
+
   }finally{
     globalThis.fetch=realFetch;
     if(oldKey===undefined)delete process.env.BACHS_API_KEY;else process.env.BACHS_API_KEY=oldKey;
@@ -362,7 +415,7 @@ test('a bank payout includes its fee, stays pending until delivery and cannot be
   const base=`http://127.0.0.1:${(server.address() as any).port}`;
   const realFetch=globalThis.fetch;const oldKey=process.env.BACHS_API_KEY;const oldSecret=process.env.BACHS_WEBHOOK_SECRET;
   process.env.BACHS_API_KEY='sk_sandbox_test';process.env.BACHS_WEBHOOK_SECRET='test-secret';
-  let transfers=0,payouts=0;let remote:any;let approved=false;
+  let transfers=0,payouts=0;let remote:any;let approved=false;let loseTransferResponse=false;
   globalThis.fetch=(async(url:any,options:any)=>{
     if(String(url).startsWith(base))return realFetch(url,options);
     assert.ok(String(url).startsWith('https://sandbox-api.bachs.io/'));
@@ -376,6 +429,7 @@ test('a bank payout includes its fee, stays pending until delivery and cannot be
     }
     if(endpoint==='/v1/transfers'){
       transfers++;const body=JSON.parse(options.body);assert.equal(body.amount,'25100.00');assert.equal(body.currency,'NGN');assert.equal(body.destination,'acct_owner');
+      if(loseTransferResponse)throw new Error('simulated connection loss after transfer acceptance');
       return json({id:'tr_1',status:'paid'});
     }
     if(endpoint==='/v1/payouts'){
@@ -391,7 +445,9 @@ test('a bank payout includes its fee, stays pending until delivery and cannot be
     assert.equal(transfers,0);assert.equal(payouts,0);
     assert.equal((await pay()).status,409);assert.equal(transfers,0);assert.equal(payouts,0);
     approved=true;
-    const first=await pay();assert.equal(first.status,200);assert.equal((await first.json()).status,'pending');
+    const parallel=await Promise.all(Array.from({length:8},()=>pay()));
+    assert.ok(parallel.every(r=>r.status===200));for(const r of parallel)await r.json();
+    assert.equal(transfers,1,'concurrent payout requests fund the account once');assert.equal(payouts,1,'concurrent payout requests create one payout');
     assert.equal((await db.query<any>('SELECT payout_phase FROM investments')).rows[0].payout_phase,'week1');
     assert.equal((await db.query<any>('SELECT status FROM payouts')).rows[0].status,'pending');
     assert.equal((await pay()).status,200);assert.equal(transfers,1);assert.equal(payouts,1);
@@ -404,6 +460,18 @@ test('a bank payout includes its fee, stays pending until delivery and cannot be
     assert.equal((await db.query<any>('SELECT count(*) FROM payouts')).rows[0].count,1);
     assert.equal((await db.query<any>('SELECT status FROM payouts')).rows[0].status,'successful');
     assert.equal(transfers,1);assert.equal(payouts,1);
+    remote.status='failed';
+    const stale=Buffer.from(JSON.stringify({id:'evt_old_failed',type:'payout.failed',account:'acct_owner',organization_id:'acct_owner',data:{reference:remote.reference,id:remote.id}}));
+    const staleSig=crypto.createHmac('sha256','test-secret').update(timestamp+'.').update(stale).digest('hex');
+    assert.equal((await fetch(base+'/api/bachs/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Bachs-Timestamp':timestamp,'X-Bachs-Signature':staleSig},body:stale})).status,200);
+    assert.equal((await db.query<any>('SELECT status FROM payouts')).rows[0].status,'successful','an older failed event cannot reverse confirmed delivery');
+    await db.query("UPDATE investments SET next_payment_date=current_date");
+    loseTransferResponse=true;
+    assert.equal((await pay()).status,502);
+    assert.equal(transfers,2);assert.equal(payouts,1);
+    assert.equal((await pay()).status,200);
+    assert.equal(transfers,2,'an unknown transfer outcome must be frozen for reconciliation, never resent');
+    assert.equal(payouts,1);
   }finally{
     globalThis.fetch=realFetch;
     if(oldKey===undefined)delete process.env.BACHS_API_KEY;else process.env.BACHS_API_KEY=oldKey;

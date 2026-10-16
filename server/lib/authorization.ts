@@ -42,6 +42,7 @@ export function mountAuthorization(app: Express, database: SupabaseClient | null
       if (wantsAdmin) {
         if (!user) return res.status(401).json({ message: 'Sign in to continue.' });
         if (!database || !await isApprovedAdmin(database, user)) return res.status(403).json({ message: 'Administrator access required.' });
+        if(req.method==='DELETE' && /^\/admin\/investors\//.test(path))return res.status(409).json({message:'Account deletion is disabled to preserve financial records. Contact support for account closure.'});
         res.locals.authUser = user;
         return next();
       }

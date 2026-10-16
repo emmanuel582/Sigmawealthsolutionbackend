@@ -1,0 +1,58 @@
+{
+  "date": "2026-10-16",
+  "scope": "SigmawealthSolution frontend/backend financial hardening",
+  "productionFundsMovedByThisAudit": false,
+  "checks": {
+    "money": "BigInt minor-unit arithmetic for payment/payout settlement; PostgreSQL NUMERIC persisted records",
+    "ledger": "Payments, requests, payout jobs and referral records persist; browser writes and admin direct balance edits blocked",
+    "idempotency": "Durable per-account checkout attempt references, unique payout claims, provider keys, duplicate credit RPC guards",
+    "concurrency": "Concurrent HTTP checkout/payout attacks tested; PGlite is isolated single-process PostgreSQL and does not establish multi-connection production capacity",
+    "webhooks": "Raw signatures, duplicate/delayed/out-of-order events, read lag, and terminal payout states tested",
+    "verification": "Server provider readback and exact amount/currency/reference matching; incomplete/underpaid payments rejected",
+    "authorization": "Ownership, confirmed allowlisted admin role and service-only financial RPC tests",
+    "secrets": "Source scan passes; provider diagnostics and malformed bodies are not logged verbatim",
+    "limits": "Bounded inbound/outbound concurrency, dedicated webhook limit, request complexity/size limits, public AI/feedback request limits",
+    "audit": "Durable payment/request/payout records plus structured credit logs; external log retention not verified",
+    "reconciliation": "Read-only CLI compares latest 50 hosted checkouts, involved account contribution totals and unfinished payout jobs",
+    "failures": "Injected database failure rolls back all credit changes; uncertain transfers/checkouts are reserved for reconciliation rather than resent"
+  },
+  "verification": {
+    "backendTests": 23,
+    "frontendTests": 15,
+    "moneyFuzzCases": 2000,
+    "localLoad": {
+      "requests": 600,
+      "concurrency": 25,
+      "durationMs": 1617,
+      "p95Ms": 128,
+      "status200": 400,
+      "status429": 200,
+      "healthFailures": 0,
+      "unexpectedResponses": 0,
+      "limitation": "Public config and health endpoints on local production build; excludes provider/database latency"
+    },
+    "liveReconciliation": {
+      "checkoutRequests": 3,
+      "completed": 1,
+      "pending": 2,
+      "issues": 0
+    },
+    "productionDependencyAdvisories": {
+      "frontend": 0,
+      "backend": 0
+    },
+    "frontendDevelopmentAdvisories": {
+      "high": 7,
+      "moderate": 3,
+      "note": "braces latest 3.0.3 is still affected; postcss-selector-parser update requires a separate compatibility upgrade"
+    }
+  },
+  "remaining": {
+    "hosting": "Last supplied Render configuration is Free. Use a paid always-on instance and stage database/provider load testing before increasing traffic.",
+    "rateLimits": "In-memory instance limits do not provide distributed bot protection; configure platform WAF and shared limiter before horizontal scaling.",
+    "auth": "Login/OTP go directly to Supabase; project rate-limit/CAPTCHA/MFA settings require dashboard verification.",
+    "recovery": "Verify database backups/PITR and perform a restore drill; external log retention and alerting need configuration.",
+    "automation": "No cron credentials created or automatic payouts/debits activated by this work.",
+    "coverage": "Not a third-party penetration test, disaster recovery certification, or proof of unlimited traffic capacity; live saved-card debit/bank delivery not exercised."
+  }
+}

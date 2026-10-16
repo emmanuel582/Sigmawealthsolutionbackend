@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { minorUnits, majorUnits } from './exactMoney.js';
 
 export class BachsError extends Error {
   constructor(message: string, public status = 502, public code = 'BACHS_ERROR') { super(message); }
@@ -31,15 +32,10 @@ export function bachsWebhookUrl(): string {
 
 /** Bachs uses decimal strings in major units, never minor units. */
 export function decimalAmount(value: unknown, allowZero = false): string {
-  const text = String(value ?? '').trim();
-  if (!/^\d+(\.\d{1,2})?$/.test(text)) throw new BachsError('Amount must have at most two decimal places.', 400);
-  const [whole, fractional = ''] = text.split('.');
-  const cents = BigInt(whole) * BigInt(100) + BigInt(fractional.padEnd(2, '0'));
-  if (cents > BigInt(Number.MAX_SAFE_INTEGER) || (allowZero ? cents < BigInt(0) : cents <= BigInt(0))) {
-    throw new BachsError('Amount is outside the supported range.', 400);
-  }
-  return `${cents / BigInt(100)}.${String(cents % BigInt(100)).padStart(2, '0')}`;
+  return majorUnits(minorUnits(value, allowZero));
 }
+
+let activeProviderRequests=0;
 
 export async function bachsRequest<T = any>(endpoint: string, options: {
   method?: 'GET' | 'POST' | 'PATCH' | 'DELETE'; body?: unknown; idempotencyKey?: string; accountId?: string;
@@ -51,6 +47,9 @@ export async function bachsRequest<T = any>(endpoint: string, options: {
   if (options.body !== undefined) headers['Content-Type'] = 'application/json';
   if (options.idempotencyKey) headers['Idempotency-Key'] = options.idempotencyKey;
   if (options.accountId) headers['X-Account-Id'] = options.accountId;
+  if(activeProviderRequests>=32)throw new BachsError('Payment service is busy. Retry shortly using the same reference.',503,'PROVIDER_BUSY');
+  activeProviderRequests++;
+  try {
   let response: globalThis.Response;
   try {
     response = await fetch(`${base}${endpoint}`, {
@@ -63,12 +62,14 @@ export async function bachsRequest<T = any>(endpoint: string, options: {
   const data = await response.json().catch(() => null);
   if (!response.ok) {
     // Never expose upstream request details or credentials in an error.
-    const code = String(data?.error_code || 'BACHS_ERROR');
-    const message = String(data?.detail || data?.message || `Bachs request failed (${response.status}).`).replaceAll(bachsApiKey(), '[redacted]');
+    const rawCode=String(data?.error_code || 'BACHS_ERROR');
+    const code=/^[A-Z0-9_]{1,64}$/.test(rawCode)?rawCode:'BACHS_ERROR';
+    const message='Bachs could not complete the operation ('+response.status+'). Contact support with your payment reference.';
     throw new BachsError(message, response.status >= 500 ? 502 : response.status, code);
   }
   if (!data) throw new BachsError('Bachs returned an unreadable response.', 502, 'OUTCOME_UNKNOWN');
   return data as T;
+  } finally {activeProviderRequests--;}
 }
 
 /** Verify exact bytes, all rotation signatures, and a five-minute timestamp window. */

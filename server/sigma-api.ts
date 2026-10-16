@@ -5,6 +5,8 @@ import fs from 'fs';
 import dotenv from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
 import crypto from 'crypto';
+import { payoutAmount } from './lib/exactMoney.js';
+import { safeProfileUpdates } from './lib/profileUpdates.js';
 import { mountBachsRoutes } from './lib/bachsRoutes.js';
 import { mountAuthorization, isApprovedAdmin } from './lib/authorization.js';
 import { FUNDING_PLAN_AMOUNTS } from '../lib/sigma/fundingPlans.js';
@@ -27,14 +29,14 @@ applySecurityMiddleware(app);
 // Preserve exact Bachs webhook bytes before JSON parsing and sanitization.
 
 app.use(express.json({
-  limit: '10mb',
+  limit: '256kb',
   verify: (req: any, _res, buf) => {
     if (req.originalUrl?.startsWith('/api/bachs/webhook')) {
       req.rawBody = buf;
     }
   },
 }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(express.urlencoded({ extended: false, limit: '64kb', parameterLimit:100 }));
 app.use(sanitizeRequestBody);
 
 // Health check endpoints for hosting (Render, Vercel, monitoring)
@@ -386,7 +388,7 @@ type PayoutWeek = 1 | 2 | 3 | 4;
 
 function getInterestRate(): number {
   const rate = Number(store.platform_settings.interest_rate);
-  return Number.isFinite(rate) && rate >= 0 ? rate : 0.15;
+  return Number.isFinite(rate) && rate >= 0 && rate <= 1 ? rate : 0.15;
 }
 
 function normalizePayoutWeek(raw: unknown): PayoutWeek {
@@ -422,7 +424,7 @@ function computePayoutForInvestment(inv: any): {
   const currency = normalizeCurrency(inv.currency || PAYMENT_CURRENCY);
   const week = normalizePayoutWeek(inv.payout_phase);
   const interestRate = getInterestRate();
-  const principalComponent = Math.round(principal * WEEKLY_SHARE);
+  const principalComponent = principal>0 ? Number(payoutAmount(inv.amount,false,'0')) : 0;
 
   if (week < 4) {
     return {
@@ -436,9 +438,10 @@ function computePayoutForInvestment(inv: any): {
     };
   }
 
-  const interest = Math.round(principal * interestRate);
+  const finalAmount=principal>0 ? Number(payoutAmount(inv.amount,true,interestRate)) : 0;
+  const interest = finalAmount-principalComponent;
   return {
-    amount: principalComponent + interest,
+    amount: finalAmount,
     currency,
     phase: 'week4',
     week: 4,
@@ -1087,7 +1090,9 @@ app.delete('/api/admin/investors/:id', async (req: Request, res: Response) => {
 // Update investor record
 app.patch('/api/admin/investors/:id', async (req: Request, res: Response) => {
   const userId = req.params.id;
-  const { updates, adminName } = req.body;
+  const updates=safeProfileUpdates(req.body.updates);
+  if(!updates)return res.status(400).json({message:'Only name and phone can be edited. Financial balances require verified ledger transactions.'});
+  const adminName=res.locals.authUser?.email || 'Admin';
 
   const profile = store.profiles.get(userId) || { id: userId, email: 'investor@example.com' };
   Object.assign(profile, updates);
@@ -1693,8 +1698,15 @@ async function startServer() {
   }
 
   // API-only server — Next.js serves the frontend on :3000
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`SigmaWealth API running at http://localhost:${PORT}`);
+  const server=app.listen(PORT, '0.0.0.0', () => {
+    console.log('SigmaWealth API listening on port '+PORT);
+  });
+  server.requestTimeout=30_000;
+  server.headersTimeout=15_000;
+  server.keepAliveTimeout=5_000;
+  process.once('SIGTERM',()=>{
+    server.close(()=>process.exit(0));
+    setTimeout(()=>{server.closeAllConnections();process.exit(0);},25_000).unref();
   });
 }
 

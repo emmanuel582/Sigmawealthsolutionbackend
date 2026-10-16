@@ -1,6 +1,7 @@
 import type { Express, Request, Response, NextFunction } from 'express';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import crypto from 'node:crypto';
+import { minorUnits, majorUnits, payoutAmount } from './exactMoney.js';
 import { isApprovedAdmin, secretMatches } from './authorization.js';
 import { isPlatformConnectReady } from './bachsCapabilities.js';
 import { FUNDING_PLAN_AMOUNTS, FUNDING_PLAN_ERROR, getFundingPlan, isFundingPlanAmount } from '../../lib/sigma/fundingPlans.js';
@@ -40,7 +41,8 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
   async function identity(req: Request, admin = false): Promise<{ id: string; email: string; metadata: Record<string,any> }> {
     const token = req.headers.authorization?.replace(/^Bearer\s+/i, '');
     if (!token) throw new BachsError('Sign in to continue.', 401);
-    const { data, error } = await db().auth.getUser(token);
+    const cached=(req as any).res?.locals.authUser;
+    const { data, error } = cached ? {data:{user:cached},error:null} : await db().auth.getUser(token);
     if (error || !data.user) throw new BachsError('Your session has expired. Sign in again.', 401);
     const user = { id: data.user.id, email: data.user.email || '', metadata:data.user.user_metadata || {} };
     if (admin) {
@@ -130,11 +132,16 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
       if (session.payment_status !== 'succeeded' || String(session.currency).toUpperCase() !== 'NGN' || decimalAmount(session.amount) !== decimalAmount(request.amount)) {
         throw new BachsError('The payment amount, currency, or settlement status does not match.', 409);
       }
+      if (session.charge?.amount_paid != null && minorUnits(session.charge.amount_paid,true) !== minorUnits(request.amount)
+        || session.charge?.amount_remaining != null && minorUnits(session.charge.amount_remaining,true) !== 0n) {
+        throw new BachsError('The payment has not been collected in full.',409,'UNDERPAID');
+      }
       if (!paymentId) throw new BachsError('Payment ID is not available yet. Try syncing again shortly.', 409);
     } else if (session.mode !== 'setup' || Number(session.amount) !== 0) {
       throw new BachsError('The saved-card setup could not be confirmed.', 409);
     }
     const result = remember(await query(db().rpc('bachs_credit_payment', { p_reference: request.reference, p_payment_id: paymentId || '' })));
+    if(result.newCredit)console.info(JSON.stringify({event:'payment_credited',reference:request.reference,userId:request.user_id,amount:decimalAmount(request.amount),currency:'NGN'}));
     await refreshCard(request.user_id);
     return { ...result, success: true, message: request.setup_only ? 'Saved-card setup confirmed.' : 'Bachs payment confirmed and credited.' };
   }
@@ -184,16 +191,15 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     }
     return { status: 'pending', reference: job.reference, payoutId: job.payout_id };
   }
-  async function sendPayout(userId: string, mode: 'automatic' | 'manual', actor: string, override?: number, reward?: any) {
+  async function sendPayout(userId: string, mode: 'automatic' | 'manual', actor: string, override?: unknown, reward?: any) {
     requireBusinessApproval();
     await requireStorageReady();
-    const inv = reward ? {id:null,amount:Number(reward.amount)*4,payout_phase:'referral',next_payment_date:reward.created_at.slice(0,10)}
+    const inv = reward ? {id:null,payout_phase:'referral',next_payment_date:reward.created_at.slice(0,10)}
       : await query(db().from('investments').select('*').eq('user_id', userId).eq('status','active').order('created_at', { ascending: false }).limit(1).maybeSingle());
     if (!inv || !inv.next_payment_date || inv.next_payment_date > new Date().toISOString().slice(0,10)) throw new BachsError('No investment payout is due for this investor.', 409);
     const phase = reward ? 'referral' : /^week[1-4]$/.test(inv.payout_phase) ? inv.payout_phase : 'week1';
-    const due = Number(inv.amount) * (0.25 + (phase === 'week4' ? Number(store.platform_settings.interest_rate ?? 0.15) : 0));
-    if (override !== undefined && decimalAmount(override) !== decimalAmount(Number(due.toFixed(2)))) throw new BachsError('The payout must match the amount due for this investment week.',400,'PAYOUT_AMOUNT_MISMATCH');
-    const amount = decimalAmount(Number((override || due).toFixed(2)));
+    const amount = reward ? decimalAmount(reward.amount) : payoutAmount(inv.amount, phase === 'week4', store.platform_settings.interest_rate ?? '0.15');
+    if (override !== undefined && decimalAmount(override) !== amount) throw new BachsError('The payout must match the amount due for this investment week.',400,'PAYOUT_AMOUNT_MISMATCH');
     const existing = await query(reward ? db().from('bachs_payout_jobs').select('*').eq('reward_id',reward.id).maybeSingle()
       : db().from('bachs_payout_jobs').select('*').eq('investment_id', inv.id).eq('phase', phase).eq('due_date', inv.next_payment_date).maybeSingle());
     if (existing) return existing.payout_id ? reconcileJob(existing) : { status: 'pending', reference: existing.reference, message: 'This payout has already been claimed. Reconciliation is required before another money movement.' };
@@ -208,11 +214,12 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     try {
       // Quotes report net delivery. Confirm a second quote covers the exact requested amount and fee.
       const quote = await bachsRequest('/v1/payouts/quotes', { method:'POST', accountId, idempotencyKey:`quote:${reference}:1`, body:{from_currency:'NGN',to_currency:'NGN',amount} });
-      const fee = Number(quote.from_amount) - Number(quote.to_amount);
-      if (!Number.isFinite(fee) || fee < 0) throw new BachsError('The payout fee could not be verified.', 409);
-      const total = decimalAmount(Number((Number(amount) + fee).toFixed(2)));
+      if(decimalAmount(quote.from_amount)!==amount)throw new BachsError('Payout quote amount mismatch.',409);
+      const fee = minorUnits(quote.from_amount) - minorUnits(quote.to_amount,true);
+      if (fee < 0n) throw new BachsError('The payout fee could not be verified.', 409);
+      const total = majorUnits(minorUnits(amount) + fee);
       const confirmed = await bachsRequest('/v1/payouts/quotes', { method:'POST', accountId, idempotencyKey:`quote:${reference}:2`, body:{from_currency:'NGN',to_currency:'NGN',amount:total} });
-      if (decimalAmount(confirmed.to_amount) !== amount) throw new BachsError('The payout quote does not deliver the requested amount.', 409);
+      if (decimalAmount(confirmed.from_amount) !== total || decimalAmount(confirmed.to_amount) !== amount) throw new BachsError('The payout quote does not deliver the requested amount.', 409);
       await query(db().from('bachs_payout_jobs').update({ total_debit:total, status:'transferring' }).eq('reference',reference));
       const transfer = await bachsRequest('/v1/transfers', { method:'POST', idempotencyKey:`transfer:${reference}`, body:{destination:accountId,amount:total,currency:'NGN',transfer_group:reference,metadata:{reference}} });
       await query(db().from('bachs_payout_jobs').update({transfer_id:transfer.id,status:'funded'}).eq('reference',reference));
@@ -258,6 +265,24 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     if (!result.resolved || !result.account_name) throw new BachsError('Bachs could not verify this account.',400);
     res.json({data:result});
   }));
+  function checkoutAddress(session: any): string {
+    let address: URL;
+    try { address=new URL(session.checkout_url); } catch { throw new BachsError('Bachs did not return a usable checkout.',502); }
+    if(address.protocol!=='https:' || address.username || address.password || address.port || !['checkout.bachs.io','sandbox-checkout.bachs.io'].includes(address.hostname))throw new BachsError('Bachs returned an unexpected checkout address.',502);
+    return address.href;
+  }
+  async function resumeCheckout(request: any, amount: string, monthlyAmount: string | null) {
+    const enrolledAmount=request.monthly_amount==null?null:decimalAmount(request.monthly_amount);
+    const expectedAmount=request.setup_only?enrolledAmount:decimalAmount(request.amount);
+    if(expectedAmount!==amount || enrolledAmount!==monthlyAmount)throw new BachsError('This payment attempt belongs to a different funding plan.',409,'IDEMPOTENCY_CONFLICT');
+    if(request.credited)throw new BachsError('This payment is already credited. Refresh your dashboard before starting another contribution.',409,'ALREADY_CREDITED');
+    if(!request.checkout_id)throw new BachsError('This payment attempt is still being reconciled. Use Sync or contact support; do not start another payment.',503,'RECONCILIATION_REQUIRED');
+    const session=await bachsRequest('/v1/checkout-sessions/'+encodeURIComponent(request.checkout_id));
+    if(session.reference!==request.reference || session.checkout_id!==request.checkout_id)throw new BachsError('Checkout reference mismatch.',409);
+    if(session.status==='completed')return {...await settleCheckout(request),completed:true,reference:request.reference,chargeId:request.checkout_id,sessionId:request.checkout_id,redirectUrl:null};
+    if(session.status!=='open')throw new BachsError('This checkout has expired or was cancelled. Start a new payment attempt.',409,'CHECKOUT_EXPIRED');
+    return {success:true,completed:false,status:'pending',chargeId:request.checkout_id,sessionId:request.checkout_id,reference:request.reference,redirectUrl:checkoutAddress(session),amountCharged:Number(request.amount),monthlyPlanAmount:enrolledAmount?Number(enrolledAmount):null,setupOnly:request.setup_only};
+  }
   app.post('/api/bachs/initiate', endpoint(async (req,res) => {
     const user = await identity(req);
     const amount = decimalAmount(req.body.amount);
@@ -267,6 +292,11 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     const recurring = req.body.isRecurringPlan === true;
     const monthlyAmount = recurring ? decimalAmount(req.body.monthlyPlanAmount || req.body.amount) : null;
     if (monthlyAmount && monthlyAmount !== amount) throw new BachsError('The monthly amount must match the selected funding plan.',400,'INVALID_FUNDING_PLAN');
+    const key=req.body.idempotencyKey || req.get('Idempotency-Key');
+    if(typeof key!=='string' || !/^[a-zA-Z0-9_-]{16,100}$/.test(key))throw new BachsError('A valid payment attempt key is required. Refresh the page and try again.',400,'IDEMPOTENCY_KEY_REQUIRED');
+    const reference='sigma-'+crypto.createHash('sha256').update(user.id+':'+key).digest('hex');
+    const previous=await requestFor(reference);
+    if(previous)return res.json(await resumeCheckout(previous,amount,monthlyAmount));
     requireBusinessApproval();
     const profile = await profileFor(user);
     await requireStorageReady();
@@ -274,9 +304,10 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     const customer = await customerFor(user, profile.name || 'Investor');
     const setupOnly = recurring && Number(profile.total_invested)>0;
     const chargeAmount = setupOnly ? '0.00' : amount;
-    const reference = `sigma-${crypto.randomUUID()}`;
     const request = { reference,user_id:user.id,kind:'checkout',amount:chargeAmount,currency:'NGN',phase:String(req.body.phase || 'Active Plan'),monthly_amount:monthlyAmount,setup_only:setupOnly };
-    await query(db().from('bachs_requests').insert(request));
+    const claim=await db().from('bachs_requests').insert(request);
+    if(claim.error?.code==='23505')return res.json(await resumeCheckout(await requestFor(reference),amount,monthlyAmount));
+    await query(Promise.resolve(claim));
     const session = await bachsRequest('/v1/checkout-sessions', { method:'POST',idempotencyKey:reference,body:{
       ...(setupOnly?{}:{pricing:{amount:chargeAmount,currency:'NGN'}}), customer:{customer_id:customer.customer_id},
       reference,metadata:{userId:user.id,reference,fundingPlan:plan.id},save_payment_method:recurring,
@@ -286,12 +317,10 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     } });
     const checkoutId = session.checkout_id;
     if (!checkoutId || !session.checkout_url) throw new BachsError('Bachs did not return a usable checkout.',502);
-    const checkoutAddress = new URL(session.checkout_url);
-    const checkoutHost = checkoutAddress.hostname;
-    if (checkoutAddress.protocol !== 'https:' || !['checkout.bachs.io','sandbox-checkout.bachs.io'].includes(checkoutHost)) throw new BachsError('Bachs returned an unexpected checkout address.',502);
+    const redirectUrl = checkoutAddress(session);
     await query(db().from('bachs_requests').update({checkout_id:checkoutId}).eq('reference',reference));
     res.json({success:true,completed:false,status:'pending',chargeId:checkoutId,sessionId:checkoutId,reference,
-      redirectUrl:session.checkout_url,amountCharged:Number(chargeAmount),monthlyPlanAmount:monthlyAmount?Number(monthlyAmount):null,setupOnly});
+      redirectUrl,amountCharged:Number(chargeAmount),monthlyPlanAmount:monthlyAmount?Number(monthlyAmount):null,setupOnly});
   }));
   app.post('/api/bachs/verify', endpoint(async (req,res) => {
     const user = await identity(req);
@@ -402,7 +431,7 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
   }));
   app.post('/api/admin/payouts/manual-pay', endpoint(async (req,res) => {
     const user=await identity(req,true); if(!req.body.userId || !req.body.referenceNote) throw new BachsError('Investor and reference note required.',400);
-    const result=await sendPayout(req.body.userId,'manual',user.email,req.body.amount!==undefined && req.body.amount!==null?Number(decimalAmount(req.body.amount)):undefined);
+    const result=await sendPayout(req.body.userId,'manual',user.email,req.body.amount!==undefined && req.body.amount!==null?decimalAmount(req.body.amount):undefined);
     res.json(result.payout || {user_id:req.body.userId,amount:req.body.amount,status:'pending',notes:'Bachs payout awaiting confirmation'});
   }));
   app.post('/api/admin/payouts/manual-batch', endpoint(async (req,res) => {
@@ -473,11 +502,14 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
       const reference=data.reference || data.metadata?.reference;
       const request=(reference || data.checkout_id)?await requestFor(reference,data.checkout_id):null;
       if(request) {
-        if(request.kind==='checkout') await settleCheckout(request,data.checkout_id);
+        if(request.kind==='checkout') {
+          const result=await settleCheckout(request,data.checkout_id);
+          if(!result.success)throw new BachsError('Payment confirmation is not available yet. Retry this event.',503,'SETTLEMENT_PENDING');
+        }
         else {
           const payment=await bachsRequest(`/v1/payments/${encodeURIComponent(request.payment_id || data.payment_id || data.charge_id)}`);
-          const fee=payment.merchant_bears_cost===false?Number(payment.fees?.amount || 0):0;
-          if(payment.reference!==request.reference || payment.status!=='succeeded' || payment.currency!=='NGN' || Number(payment.amount)-fee!==Number(request.amount)) throw new BachsError('Auto-debit settlement mismatch.',409);
+          const fee=payment.merchant_bears_cost===false?minorUnits(payment.fees?.amount || '0',true):0n;
+          if(payment.reference!==request.reference || payment.status!=='succeeded' || payment.currency!=='NGN' || minorUnits(payment.amount)-fee!==minorUnits(request.amount)) throw new BachsError('Auto-debit settlement mismatch.',409);
           remember(await query(db().rpc('bachs_credit_payment',{p_reference:request.reference,p_payment_id:payment.payment_id})));
           await refreshCard(request.user_id);
         }

@@ -2,6 +2,7 @@ import type { Express, Request, Response, NextFunction } from 'express';
 import helmet from 'helmet';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
+import { concurrencyGuard } from './traffic.js';
 
 /** Allowed browser origins for the Next.js frontend */
 export function getAllowedOrigins(): string[] {
@@ -23,6 +24,8 @@ export function applySecurityMiddleware(app: Express): void {
 
   app.set('trust proxy', 1);
   app.disable('x-powered-by');
+  app.use(concurrencyGuard());
+  app.use('/api',(_req,res,next)=>{res.set('Cache-Control','no-store');next();});
 
   app.use(
     helmet({
@@ -61,7 +64,7 @@ export function applySecurityMiddleware(app: Express): void {
       },
       credentials: true,
       methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'Authorization', 'X-Support-Token', 'X-Requested-With', 'Accept', 'Origin'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'Idempotency-Key', 'X-Support-Token', 'X-Requested-With', 'Accept', 'Origin'],
       maxAge: 600,
     })
   );
@@ -72,6 +75,7 @@ export function applySecurityMiddleware(app: Express): void {
     rateLimit({
       windowMs: 15 * 60 * 1000,
       max: Number(process.env.API_RATE_LIMIT_MAX || 300),
+      skip: req => req.originalUrl.split('?')[0] === '/api/bachs/webhook',
       standardHeaders: true,
       legacyHeaders: false,
       message: { message: 'Too many requests. Please try again later.' },
@@ -99,12 +103,18 @@ export function applySecurityMiddleware(app: Express): void {
   const paymentLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     max: Number(process.env.PAYMENT_RATE_LIMIT_MAX || 60),
+    skip: req => req.originalUrl.split('?')[0] === '/api/bachs/webhook',
     standardHeaders: true,
     legacyHeaders: false,
     message: { message: 'Too many payment attempts. Please try again later.' },
   });
+  app.use('/api/bachs/webhook',rateLimit({windowMs:60_000,max:Number(process.env.WEBHOOK_RATE_LIMIT_MAX || 600),standardHeaders:true,legacyHeaders:false}));
   app.use('/api/bachs/', paymentLimiter);
   app.use('/api/payouts/', paymentLimiter);
+  app.use('/api/admin/payouts/', paymentLimiter);
+  app.use('/api/verify-account', paymentLimiter);
+  app.use('/api/investor/connect/', paymentLimiter);
+  app.use('/api/investor/bank-details', paymentLimiter);
 }
 
 /** Hide stack traces in production */
@@ -115,8 +125,7 @@ export function productionErrorHandler(
   _next: NextFunction
 ): void {
   const isProd = process.env.NODE_ENV === 'production';
-  console.error('[API Error]', err.message);
-  if (!isProd) console.error(err.stack);
+  console.error('[API Error]', err.message === 'Not allowed by CORS' ? 'CORS_REJECTED' : (err as any).status === 413 ? 'BODY_TOO_LARGE' : (err as any).type === 'entity.parse.failed' ? 'INVALID_BODY' : 'REQUEST_FAILED');
   if (err.message === 'Not allowed by CORS') {
     res.status(403).json({ message: 'Origin not allowed' });
     return;

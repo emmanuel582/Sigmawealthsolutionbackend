@@ -70,3 +70,16 @@ npm run dev
 ```
 
 API: http://127.0.0.1:4000. Frontend is in the separate Sigmawealthsolution repository.
+
+
+## Financial hardening and operational checks
+
+Checkout initiation requires a per-attempt idempotencyKey (16–100 alphanumeric, underscore or hyphen characters). The frontend persists this across retries and refreshes. The backend binds it to the authenticated account and selected plan. Lost provider responses retain the request for reconciliation; never discard a pending attempt and charge again blindly.
+
+Payment and payout calculations use integer minor units and PostgreSQL NUMERIC. Admin contact edits accept only name/phone; account deletion is disabled to preserve financial records. Webhooks have their own rate budget, and provider-read lag returns a retryable response. API JSON bodies are limited to 256 KiB; large images must be compressed before submission. Upstream error bodies and malformed JSON are not copied into logs.
+
+Run npm test for adversarial payment/security tests and npm run test:load for the loopback-only production build burst test. The load test disables external credentials and checks 600 public config/health requests; it does not estimate production checkout capacity. CI runs both.
+
+Run npm run reconcile:bachs -- /absolute/path/to/ignored/.env for a read-only report of the latest 50 checkouts, involved accounts' contribution ledger totals and unfinished payout claims. Exit code 2 means an operator must investigate discrepancies. No charge, transfer, payout or balance mutation is performed by this command. Reconciliation is not scheduled automatically.
+
+The dated reports/security-audit.json records evidence and limits. Production still needs always-on hosting, platform WAF/shared rate limiting, verified Supabase Auth abuse controls, durable log retention, alerting, and backup/restore verification. Instance limits are in memory and are not a distributed limit. Financial tests use PGlite with mocked provider calls; stage real multi-connection PostgreSQL and provider acceptance tests before scaling. Never stress-test the live customer service or enable money movement for a load test.

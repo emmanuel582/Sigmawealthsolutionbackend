@@ -13,11 +13,13 @@
     "build": "esbuild server/sigma-api.ts --platform=node --format=esm --packages=external --bundle --outfile=dist/sigma-api.js",
     "postinstall": "npm run build",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test tests/test-bachs.ts tests/security.unit.test.ts",
+    "test": "node --import tsx --test tests/test-bachs.ts tests/security.unit.test.ts tests/hardening.unit.test.ts",
     "test:bachs": "node --import tsx --test tests/test-bachs.ts",
     "test:live-bachs": "node --import tsx scripts/test-live-bachs.ts",
     "check:bachs": "node --import tsx scripts/check-bachs.mjs",
-    "check:secrets": "node scripts/check-secrets.mjs"
+    "check:secrets": "node scripts/check-secrets.mjs",
+    "reconcile:bachs": "node scripts/reconcile-bachs.mjs",
+    "test:load": "npm run build && node scripts/test-local-load.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.112.4",

@@ -7,12 +7,13 @@ const XSS_OPTIONS = {
   stripIgnoreTagBody: ['script', 'style'],
 };
 
-function sanitizeValue(value: unknown): unknown {
+function sanitizeValue(value: unknown, depth = 0, budget = {left:2000}): unknown {
+  if(depth>24 || --budget.left<0)throw Object.assign(new Error("Request is too complex."),{status:400,type:"entity.parse.failed"});
   if (typeof value === 'string') {
     return xss(value, XSS_OPTIONS).trim();
   }
   if (Array.isArray(value)) {
-    return value.map(sanitizeValue);
+    return value.map(item=>sanitizeValue(item,depth+1,budget));
   }
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};
@@ -24,7 +25,8 @@ function sanitizeValue(value: unknown): unknown {
           continue;
         }
       }
-      out[k] = sanitizeValue(v);
+      if(['__proto__','constructor','prototype'].includes(k))continue;
+      out[k] = sanitizeValue(v,depth+1,budget);
     }
     return out;
   }

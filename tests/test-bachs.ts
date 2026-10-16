@@ -310,7 +310,14 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
     const pending=await post('/api/bachs/verify',{userId:user,sessionId:checkout.sessionId,txRef:checkout.reference});
     assert.equal(pending.status,202);assert.equal((await pending.json()).success,false);
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'0.00');
-    const session=sessions.get(checkout.sessionId);session.status='completed';session.payment_status='paid';
+    const session=sessions.get(checkout.sessionId);session.status='completed';
+    for (const status of ['requires_payment_method','requires_confirmation','requires_action','processing','failed','canceled']) {
+      session.payment_status=status;
+      assert.equal((await post('/api/bachs/verify',{userId:user,sessionId:checkout.sessionId,txRef:checkout.reference})).status,409);
+      assert.equal((await db.query<any>('SELECT count(*) FROM payments')).rows[0].count,0,'incomplete payments must never be credited');
+    }
+    session.payment_status='succeeded';
+    Object.assign(session.charge,{status:'succeeded',amount:'64000.00',amount_paid:'64000.00',amount_remaining:'0.00',currency:'NGN',reference:checkout.reference});
     const raw=Buffer.from(JSON.stringify({id:'evt_checkout_test',type:'collection.succeeded',data:{checkout_id:checkout.sessionId}}));
     const timestamp=String(Math.floor(Date.now()/1000));const signature=crypto.createHmac('sha256','test-secret').update(timestamp+'.').update(raw).digest('hex');
     const webhook=()=>fetch(base+'/api/bachs/webhook',{method:'POST',headers:{'Content-Type':'application/json','X-Bachs-Timestamp':timestamp,'X-Bachs-Signature':signature},body:raw});
@@ -322,7 +329,7 @@ test('hosted checkout, verified return and webhook credit only the stored owner 
     assert.equal((await webhook()).status,200);
     assert.equal((await db.query<any>('SELECT count(*) FROM payments')).rows[0].count,1);
     const next=await (await post('/api/bachs/initiate',{userId:user,amount:64000,phase:'Plan'})).json();
-    Object.assign(sessions.get(next.sessionId),{status:'completed',payment_status:'paid',amount:'63999.00'});
+    Object.assign(sessions.get(next.sessionId),{status:'completed',payment_status:'succeeded',amount:'63999.00'});
     assert.equal((await post('/api/bachs/verify',{userId:user,sessionId:next.sessionId,txRef:next.reference})).status,409);
     assert.equal((await db.query<any>('SELECT total_invested FROM profiles')).rows[0].total_invested,'64000.00');
     const setup=await (await post('/api/bachs/initiate',{userId:user,amount:98550,monthlyPlanAmount:98550,isRecurringPlan:true,phase:'Plan'})).json();

@@ -127,7 +127,7 @@ export function mountBachsRoutes(app: Express, database: SupabaseClient | null, 
     if (String(session.status).toLowerCase() !== 'completed') return { success: false, status: session.status, message: 'Payment is awaiting confirmation.' };
     let paymentId = session.charge?.payment_id || session.charge?.id || session.charge_id || session.payment_id;
     if (!request.setup_only) {
-      if (session.payment_status !== 'paid' || String(session.currency).toUpperCase() !== 'NGN' || decimalAmount(session.amount) !== decimalAmount(request.amount)) {
+      if (session.payment_status !== 'succeeded' || String(session.currency).toUpperCase() !== 'NGN' || decimalAmount(session.amount) !== decimalAmount(request.amount)) {
         throw new BachsError('The payment amount, currency, or settlement status does not match.', 409);
       }
       if (!paymentId) throw new BachsError('Payment ID is not available yet. Try syncing again shortly.', 409);
